@@ -447,6 +447,8 @@ class InductorChoices:
         """
         if not config.triton.persistent_reductions:
             return False
+        if config.numerics == "strict" and features.has_strict_sum_linear_reduction():
+            return False
         threshold = {
             ReductionHint.INNER: 1024,
         }.get(features.get_reduction_hint(), 64)

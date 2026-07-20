@@ -1375,13 +1375,34 @@ def get_reduction_combine_fn(
         raise NotImplementedError(f"unknown reduction_type={reduction_type}")
 
 
+def _strict_sum_enabled(
+    device: torch.device, reduction_type: str, reduction_ndim: int
+) -> bool:
+    if (
+        config.numerics != "strict"
+        or reduction_type != "sum"
+        or reduction_ndim != 1
+        or device.type != "cuda"
+        or torch.version.hip is not None
+        or not is_triton(device)
+    ):
+        return False
+    from torch.utils._triton import has_triton_reduction_ordering
+
+    return has_triton_reduction_ordering()
+
+
 @ir_dataclass
 class Reduction(Loops):
+    """IR node for a reduction (sum/max/prod/...) over ``reduction_ranges``."""
+
     reduction_ranges: Sequence[_IntLike]
     reduction_type: ReductionType
     # self.dtype represents the dst dtype
     src_dtype: torch.dtype
     reduction_hint: ReductionHint
+    strict_sum: bool = False
+    strict_sum_linear: bool = False
 
     def __str__(self) -> str:
         return self._to_str(("ranges", "reduction_ranges", "reduction_type"))
@@ -1443,6 +1464,8 @@ class Reduction(Loops):
             reduction_type=self.reduction_type,
             src_dtype=self.src_dtype,
             reduction_hint=ReductionHint.DEFAULT,
+            strict_sum=self.strict_sum,
+            strict_sum_linear=self.strict_sum_linear,
         )
 
     @staticmethod
@@ -1456,6 +1479,7 @@ class Reduction(Loops):
         reduction_type: ReductionType | Literal["scan"],
         reduction_numel: Expr,
         input_node: IRNode | None = None,
+        force_reduction_hint: bool = False,
     ) -> tuple[ReductionHint, _IntLike]:
         """
         Choose the reduction hint and split count from shape and input stride information.
@@ -1472,12 +1496,17 @@ class Reduction(Loops):
         # The Triton backend adds REDUCE_TO_SINGLE_ELEMENT unconditionally if the
         # cooperative_reductions feature flag is enabled, but we should still use a
         # split scan if we don't actually do a cooperative reduction.
-        should_reduce_to_single_element = V.graph.has_feature(
-            device, BackendFeature.REDUCE_TO_SINGLE_ELEMENT
-        ) and (
-            not is_triton(device)
-            or V.choices.should_use_cooperative_reduction(
-                device, numel, reduction_numel
+        strict_sum_enabled = force_reduction_hint and _strict_sum_enabled(
+            device, reduction_type, len(reduction_ranges)
+        )
+        should_reduce_to_single_element = (
+            not strict_sum_enabled
+            and V.graph.has_feature(device, BackendFeature.REDUCE_TO_SINGLE_ELEMENT)
+            and (
+                not is_triton(device)
+                or V.choices.should_use_cooperative_reduction(
+                    device, numel, reduction_numel
+                )
             )
         )
         arg_reduction_types = (
@@ -1503,9 +1532,39 @@ class Reduction(Loops):
         num_sm = props.multi_processor_count
         min_elements_per_thread = 32
         if should_split:
-            inner_reduction_splits: Callable[[int, int], int] = functools.partial(
-                V.choices.reduction_split_factor, device, inner_reduction=True
-            )
+
+            def inner_reduction_splits(
+                reduction_numel_hint: int, numel_hint: int
+            ) -> int:
+                if strict_sum_enabled:
+                    if not _is_static(reduction_numel):
+                        return 1
+                    from torch._native.ops.sum.inner_tree_plan import (  # pyrefly: ignore [missing-import]
+                        _K_TWO_KERNEL_THRESHOLD,
+                        compute_inner_tree_params,
+                        vec_size,
+                    )
+
+                    params = compute_inner_tree_params(
+                        reduction_numel_hint,
+                        numel_hint,
+                        vec_size(src_dtype.itemsize),
+                    )
+                    # Equal-sized Inductor chunks match eager's fixed batches only
+                    # when the batch size divides the reduction extent.
+                    if (
+                        params.num_batches > _K_TWO_KERNEL_THRESHOLD
+                        and reduction_numel_hint % params.batch_total_elements == 0
+                    ):
+                        return params.num_batches
+                    return 1
+                return V.choices.reduction_split_factor(
+                    device,
+                    reduction_numel_hint,
+                    numel_hint,
+                    inner_reduction=True,
+                )
+
             outer_reduction_splits: Callable[[int, int], int] = functools.partial(
                 V.choices.reduction_split_factor, device, inner_reduction=False
             )
@@ -1520,7 +1579,7 @@ class Reduction(Loops):
             outer_reduction_splits = inner_reduction_splits
 
         # easy cases
-        if numel_hint == 1:
+        if numel_hint == 1 and not force_reduction_hint:
             split = inner_reduction_splits(reduction_numel_hint, numel_hint)
             if split == 1:
                 # No need to split.
@@ -1552,7 +1611,7 @@ class Reduction(Loops):
                         # use reduction_sizes of this node or its dependent nodes directly.
                         return ReductionHint.INNER, -1
             return ReductionHint.INNER, split
-        if (
+        if not force_reduction_hint and (
             reduction_numel_hint <= min_elements_per_thread
             or numel_hint >= num_sm * 2 * 32
         ):
@@ -1794,11 +1853,37 @@ class Reduction(Loops):
                 device=device, dtype=dst_dtype, inner_fn=fn, ranges=ranges
             )
 
+        strict_hint_split = None
+        if _strict_sum_enabled(device, reduction_type, len(reduction_ranges)):
+            strict_hint_split = cls.num_splits(
+                device,
+                dst_dtype,
+                src_dtype,
+                inner_fn,
+                ranges,
+                reduction_ranges,
+                reduction_type,
+                reduction_numel,
+                input_node,
+                force_reduction_hint=True,
+            )
+            if strict_hint_split[0] != ReductionHint.INNER:
+                strict_hint_split = None
+        effective_hint = (
+            strict_hint_split[0]
+            if reduction_hint == ReductionHint.DEFAULT and strict_hint_split is not None
+            else reduction_hint
+        )
+        strict_sum = (
+            strict_hint_split is not None and effective_hint == ReductionHint.INNER
+        )
+
         if (
             isinstance(reduction_numel, Integer)
             and int(reduction_numel) < config.unroll_reductions_threshold
             and (sympy_product(ranges) != 1 or is_gpu(device.type))
             and reduction_type != "dot"
+            and not strict_sum
         ):
             # When native matmul, don't unroll the dot reduction.
 
@@ -1814,17 +1899,20 @@ class Reduction(Loops):
             )
 
         # triton doesn't support reduce to single element well, so break it up
-        hint, split = cls.num_splits(
-            device,
-            dst_dtype,
-            src_dtype,
-            inner_fn,
-            ranges,
-            reduction_ranges,
-            reduction_type,
-            reduction_numel,
-            input_node,
-        )
+        if strict_hint_split is None:
+            hint, split = cls.num_splits(
+                device,
+                dst_dtype,
+                src_dtype,
+                inner_fn,
+                ranges,
+                reduction_ranges,
+                reduction_type,
+                reduction_numel,
+                input_node,
+            )
+        else:
+            hint, split = strict_hint_split
 
         def _maybe_increase_split(split: int) -> int:
             # don't apply min_num_split constraint for static shape case.
@@ -1864,6 +1952,7 @@ class Reduction(Loops):
                 new_reduction_ranges,
                 reduction_type,
                 reduction_hint,
+                strict_sum=strict_sum,
             )
         elif split > 1:
             # triton doesn't support reduce to single element well, so break it up
@@ -1878,6 +1967,7 @@ class Reduction(Loops):
                 split,
                 reduction_hint,
                 input_node,
+                strict_sum=strict_sum,
             )
 
             # Find the reduction that get split
@@ -1932,6 +2022,7 @@ class Reduction(Loops):
                 reduction_type=reduction_type,
                 src_dtype=src_dtype,
                 reduction_hint=reduction_hint,
+                strict_sum=strict_sum,
             )
         )
         return out
@@ -2118,6 +2209,7 @@ class Reduction(Loops):
         reduction_type: ReductionType,
         split: _IntLike,
         reduction_hint: ReductionHint,
+        strict_sum: bool = False,
     ) -> TensorBox:
         """
         Break a large reduction up into multiple smaller reductions
@@ -2168,6 +2260,8 @@ class Reduction(Loops):
                 reduction_type=reduction_type,
                 src_dtype=src_dtype,
                 reduction_hint=reduction_hint,
+                strict_sum=strict_sum,
+                strict_sum_linear=strict_sum,
             )
         )
 
@@ -2184,6 +2278,8 @@ class Reduction(Loops):
         split: _IntLike,
         reduction_hint: ReductionHint,
         input_node: IRNode | None = None,
+        *,
+        strict_sum: bool = False,
     ) -> TensorBox:
         """
         Break a large reduction up into multiple smaller reductions
@@ -2215,6 +2311,7 @@ class Reduction(Loops):
             reduction_type,
             split,
             reduction_hint,
+            strict_sum,
         )
 
     @classmethod
@@ -2230,6 +2327,8 @@ class Reduction(Loops):
         new_reduction_ranges: list[Integer],
         reduction_type: ReductionType,
         reduction_hint: ReductionHint,
+        *,
+        strict_sum: bool = False,
     ) -> TensorBox:
         """
         Break a large reduction up into multiple smaller reductions
@@ -2254,6 +2353,7 @@ class Reduction(Loops):
             reduction_type,
             -1,
             reduction_hint,
+            strict_sum,
         )
 
 
@@ -5439,6 +5539,8 @@ class ComputedBuffer(OperationBuffer):
                 reduction_type=old_data.reduction_type,
                 src_dtype=old_data.src_dtype,
                 reduction_hint=old_data.reduction_hint,
+                strict_sum=old_data.strict_sum,
+                strict_sum_linear=old_data.strict_sum_linear,
             )
             self.data = new_data
             # this layout does not matter since we skip tl.store

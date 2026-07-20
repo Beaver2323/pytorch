@@ -193,6 +193,19 @@ def has_triton_stable_tma_api() -> bool:
 
 
 @functools.cache
+def has_triton_reduction_ordering() -> bool:
+    """Whether the available Triton exposes ``tl.ReductionOrdering``."""
+    if has_triton_package():
+        try:
+            from triton.language import ReductionOrdering  # noqa: F401
+
+            return True
+        except ImportError:
+            pass
+    return False
+
+
+@functools.cache
 def has_triton() -> bool:
     if not has_triton_package():
         return False

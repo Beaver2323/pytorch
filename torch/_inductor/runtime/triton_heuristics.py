@@ -822,6 +822,9 @@ class CachingAutotuner(KernelInterface):
         """Whether ``_dynamic_scale_rblock`` should attempt occupancy-
         driven rblock halving for this autotuner.
         """
+        if self.inductor_meta.get("numerics") == "strict":
+            # Strict numerics: don't scale/tune R0_BLOCK for reductions (it shifts the order).
+            return False
         return _could_dynamic_scale_rblock(
             size_hints=self.size_hints,
             heuristic_type=self.heuristic_type,
@@ -2254,9 +2257,11 @@ class CachingAutotuner(KernelInterface):
             HeuristicType.FIXED,
         ):
             return False
-        # Deterministic mode forbids tuning RBLOCK / num_warps for reductions
-        # because those knobs shift numerics.
-        if self.deterministic_mode and self.heuristic_type in (
+        # Deterministic mode (and strict numerics) forbid tuning RBLOCK / num_warps for
+        # reductions because those knobs shift numerics.
+        if (
+            self.deterministic_mode or self.inductor_meta.get("numerics") == "strict"
+        ) and self.heuristic_type in (
             HeuristicType.REDUCTION,
             HeuristicType.PERSISTENT_REDUCTION,
             HeuristicType.SPLIT_SCAN,
@@ -4481,12 +4486,42 @@ def _reduction_configs(
     from torch._inductor.heuristics.registry import get_codegen_heuristic
 
     reduction_heuristic = get_codegen_heuristic("reduction", triton_meta["device"].type)
-    return reduction_heuristic.get_configs(
+    configs = reduction_heuristic.get_configs(
         size_hints=size_hints,
         inductor_meta=inductor_meta,
         triton_meta=triton_meta,
         num_dynamic=num_dynamic,
     )
+    if inductor_meta.get("numerics") == "strict":
+        configs = _force_strict_rblock(configs, size_hints, inductor_meta)
+    return configs
+
+
+def _force_strict_rblock(
+    configs: list[Config],
+    size_hints: dict[str, int],
+    inductor_meta: InductorMeta,
+) -> list[Config]:
+    # Match eager's fixed per-batch tile; persistent configs have no R0_BLOCK.
+    from torch._native.ops.sum.inner_tree_plan import (  # pyrefly: ignore [missing-import]
+        compute_inner_tree_params,
+        vec_size,
+    )
+
+    if inductor_meta.get("strict_sum_linear"):
+        r0 = 1
+    else:
+        itemsize = inductor_meta.get("strict_sum_itemsize")
+        if itemsize is None:
+            raise AssertionError("strict sum reduction requires its source itemsize")
+        r0 = compute_inner_tree_params(
+            get_total_reduction_numel(size_hints), 1, vec_size(itemsize)
+        ).batch_total_elements
+    out = copy.deepcopy(configs)
+    for triton_config in out:
+        if "R0_BLOCK" in triton_config.kwargs:
+            triton_config.kwargs["R0_BLOCK"] = r0
+    return unique_configs(out)
 
 
 def filter_reduction_configs_for_determinism(
