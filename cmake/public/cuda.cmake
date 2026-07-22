@@ -74,6 +74,12 @@ if(CUDA_VERSION VERSION_LESS 12.1)
   message(FATAL_ERROR "PyTorch requires CUDA 12.1 or above.")
 endif()
 
+# sccache issue with nvcc 13.3+ https://github.com/pytorch/pytorch/issues/190832
+if(CUDA_VERSION VERSION_GREATER_EQUAL 13.4 AND CMAKE_CUDA_COMPILER_LAUNCHER MATCHES "sccache")
+  message(STATUS "Disabling sccache for CUDA on CUDA ${CUDA_VERSION} (nvcc --dryrun --simt-only parser bug)")
+  unset(CMAKE_CUDA_COMPILER_LAUNCHER CACHE)
+endif()
+
 if(CUDA_FOUND)
   # Sometimes, we may mismatch nvcc with the CUDA headers we are
   # compiling with, e.g., if a ccache nvcc is fed to us by CUDA_NVCC_EXECUTABLE
