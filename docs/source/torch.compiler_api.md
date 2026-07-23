@@ -88,14 +88,28 @@ For a quick overview of `torch.compiler`, see {ref}`torch.compiler_overview`.
        ``"eager"`` keeps the captured ATen graph (layout-flexible, no kernels; shapes
        are still specialized to the example).
    :param tracer: capture front-end. ``"make_fx"`` (default) is a non-strict make_fx
-       trace and the only tracer implemented today; ``"dynamo"`` is planned and raises
-       ``NotImplementedError`` for now.
+       trace. ``"dynamo"`` analyzes the Python (bytecode) rather than tracing one path and
+       inlines the transformed bytecode Dynamo produces into ``python_code``, lowering the
+       compiled subgraph through the same ``backend`` choices; it is scoped to inference
+       forward computations today (a training step or other graph-breaking ``fn``,
+       ``mark_unbacked`` dynamic shapes, and ``decompositions`` are not supported with it
+       yet and raise). Unlike ``make_fx``, the dynamo driver does NOT re-validate the
+       runtime model/inputs, so on the eager backend a drifted model (broken weight tying,
+       a retyped/reshaped weight) or a broadcast-compatible input-shape mismatch can
+       silently miscompute where ``make_fx`` would raise; pass a model and inputs matching
+       the example. The dynamo artifact inlines marshalled bytecode plus a pickled state
+       blob, so it is locked to the Python version that produced it AND, because its import
+       aliases can reference private ``torch._dynamo`` modules, to a compatible torch build,
+       unlike ``make_fx`` source (Python-version portable on either backend; use
+       ``backend='eager'`` for portability across torch builds too, since the default
+       ``make_fx`` inductor artifact inlines private ``torch._inductor`` modules).
    :param decompositions: Optional decomposition table (``dict`` of ``OpOverload`` to a
-       decomposition function) forwarded to ``make_fx``; defaults to ``None``.
+       decomposition function) forwarded to ``make_fx``; defaults to ``None``. Honored only
+       by ``tracer="make_fx"``; passing it with ``tracer="dynamo"`` raises.
    :returns: ``(python_code, cache)`` -- a self-contained Python source string (the
        single source of truth for the calling convention) and a binary acceleration
        cache (no weights, no calling-convention metadata; it carries a small
-       format/version/backend/code_hash integrity tag that ``load`` verifies).
+       format/version/backend/tracer/code_hash integrity tag that ``load`` verifies).
    :raises PrecompileError: if capture, lowering, or a runtime call violates the
        contract (see the exception below).
 
@@ -131,8 +145,8 @@ For a quick overview of `torch.compiler`, see {ref}`torch.compiler_overview`.
        calling conventions are not supported.
    :raises PrecompileError: if ``python_code`` is not a valid precompile artifact (it
        fails to parse or is missing its calling-convention metadata), if ``cache`` is
-       paired with a different ``python_code`` (mismatched ``backend`` tag or
-       ``code_hash``), or if a runtime call violates the precompile contract.
+       paired with a different ``python_code`` (mismatched ``backend`` tag, ``tracer``
+       tag, or ``code_hash``), or if a runtime call violates the precompile contract.
 
 .. autoexception:: torch.compiler.PrecompileError
 ```
