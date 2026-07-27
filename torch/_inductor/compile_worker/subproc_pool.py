@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import os
 import pickle
+import signal
 import struct
 import subprocess
 import sys
@@ -286,7 +287,13 @@ class SubprocPool:
         if args or kwargs:
             # pyrefly: ignore [bad-assignment]
             job_fn = functools.partial(job_fn, *args, **kwargs)
-        job_data = self.pickler.dumps(job_fn)
+        job_data = self.pickler.dumps(
+            (
+                job_fn,
+                config.compile_worker_memory_limit_kb,
+                config.compile_worker_per_kernel_timeout,
+            )
+        )
         future: Future[_T]
         with self.futures_lock:
             job_id = next(self.job_id_count)
@@ -555,6 +562,10 @@ class SubprocMain:
         self._inflight: dict[int, float] = {}
         self._inflight_lock = threading.Lock()
         self._watchdog_stop = threading.Event()
+        self._draining = False
+        self._offender_pid: int = -1
+        self._offender_job_id: int = -1
+        self._draining_jobs: dict[int, bytes] = {}
 
     def main(self) -> None:
         # Phase heartbeats rely on fork inheritance of the shared buffer; spawn
@@ -612,6 +623,9 @@ class SubprocMain:
         # reported elapsed intentionally includes cold pool creation and the fork
         # of the workers -- that wait is real and worth surfacing.
         with self._inflight_lock:
+            if self._draining:
+                self._draining_jobs[job_id] = data
+                return
             self._inflight[job_id] = time.monotonic()
         while self.running:
             try:
@@ -687,7 +701,50 @@ class SubprocMain:
         )
         _warm_process_pool(self.pool, self.nprocs)
 
+    def _begin_draining(self, worker_pid: int, job_id: int) -> None:
+        try:
+            self._offender_pid = worker_pid
+            self._offender_job_id = job_id
+            os.kill(worker_pid, signal.SIGSTOP)
+        except ProcessLookupError:
+            pass
+        self._draining = True
+
+    def _end_draining(self) -> None:
+        if self._offender_pid == -1:
+            return
+        try:
+            os.kill(self._offender_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self._inflight.pop(self._offender_job_id, None)
+        self._shutdown_pool(terminate_workers=True)
+        self._draining = False
+        for job_id, data in self._draining_jobs.items():
+            self._submit_inner(job_id, data)
+        self._draining_jobs.clear()
+        self._offender_pid = -1
+        self._offender_job_id = -1
+
     def _start_watchdog(self) -> None:
+        enforcement = config.compile_worker_memory_enforcement
+        if config.compile_worker_memory_enforcement not in (
+            "auto",
+            "cgroup",
+            "poll",
+            "off",
+        ):
+            raise ValueError(f"Invalid memory enforcement: {enforcement!r}")
+        if enforcement == "cgroup":
+            raise RuntimeError("cgroup memory enforcement is not yet supported")
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "compile_worker_memory_enforcement",
+                "encoding": "string",
+            },
+            payload_fn=lambda: enforcement,
+        )
         interval = config.compile_worker_watchdog_interval_seconds
         if interval <= 0:
             return
@@ -698,20 +755,80 @@ class SubprocMain:
             daemon=True,
         ).start()
 
+    def _check_memory_violation(self, worker_pid: int, memory_limit: int) -> bool:
+        # TODO: Implement memory enforcement
+        if config.compile_worker_memory_enforcement == "off":
+            return False
+        return watchdog.is_worker_memory_limit_exceeded(worker_pid, memory_limit)
+
     def _watchdog_loop(self, interval: float) -> None:
         # Every `interval` seconds, report any job still running past `interval`
         # so a stuck/slow worker leaves a breadcrumb (the parent turns these into
         # tlparse artifacts). Re-reports each tick with a growing elapsed time.
+        # When per-kernel timeout / total memory limits are crossed, stop the offending worker
+        # quiesce the pool and then kill the offending worker. BrokenProcessPool recreates the pool.
+
         while not self._watchdog_stop.wait(interval):
             now = time.monotonic()
             now_ns = time.monotonic_ns()
+
             heartbeats = watchdog.read_heartbeats()
+            slow = []
+
+            drain_ready = False
+
             with self._inflight_lock:
-                slow = [
-                    (job_id, elapsed)
-                    for job_id, start in self._inflight.items()
-                    if (elapsed := now - start) >= interval
-                ]
+                if self._draining:
+                    siblings = [
+                        j
+                        for j in self._inflight
+                        if j != self._offender_job_id and j not in self._draining_jobs
+                    ]
+                    drain_ready = len(siblings) == 0
+
+                else:
+                    for job_id, start in self._inflight.items():
+                        # Slow-job STATUS reporting
+
+                        elapsed = now - start
+                        if elapsed >= interval:
+                            slow.append((job_id, elapsed))
+
+                        # Limits enforcement
+                        heartbeat = heartbeats.get(job_id)
+                        if heartbeat is None:
+                            continue
+                        _, _, worker_pid, job_start_ns, memory_limit, timeout = (
+                            heartbeat
+                        )
+                        elapsed_from_start = (now_ns - job_start_ns) / 1e9
+
+                        if timeout > 0 and elapsed_from_start >= timeout:
+                            log.warning(
+                                "Compile worker %s timed out after %.1fs on job %s; draining siblings before kill",
+                                worker_pid,
+                                elapsed_from_start,
+                                job_id,
+                            )
+
+                            self._begin_draining(worker_pid, job_id)
+                            break
+
+                        if memory_limit > 0 and self._check_memory_violation(
+                            worker_pid, memory_limit
+                        ):
+                            log.warning(
+                                "Compile worker %s memory limit exceeded on job %s; draining siblings before kill",
+                                worker_pid,
+                                job_id,
+                            )
+                            self._begin_draining(worker_pid, job_id)
+                            break
+
+            if drain_ready:
+                self._end_draining()
+                continue
+
             for job_id, elapsed in slow:
                 self._report_status(job_id, elapsed, heartbeats.get(job_id), now_ns)
 
@@ -719,12 +836,12 @@ class SubprocMain:
         self,
         job_id: int,
         elapsed: float,
-        heartbeat: tuple[int, int, int] | None,
+        heartbeat: tuple[int, int, int, int, int, int] | None,
         now_ns: int,
     ) -> None:
         status: dict[str, Any] = {"job_id": job_id, "elapsed_s": round(elapsed, 1)}
         if heartbeat is not None:
-            phase, phase_start_ns, worker_pid = heartbeat
+            phase, phase_start_ns, worker_pid, job_start_ns, _, _ = heartbeat
             status["phase"] = watchdog.Phase(phase).name.lower()
             status["phase_elapsed_s"] = round((now_ns - phase_start_ns) / 1e9, 1)
             status["worker_pid"] = worker_pid
@@ -751,9 +868,13 @@ class SubprocMain:
     @staticmethod
     def do_job(pickler: SubprocPickler, job_id: int, data: bytes) -> bytes:
         # do the pickle/unpickle in the sub-subproc
-        watchdog.set_current_job(job_id)
+        (job_fn, memory_limit, timeout) = typing.cast(
+            tuple[Callable[[], object], int, int],
+            pickler.loads(data),
+        )
+        watchdog.set_current_job(job_id, memory_limit, timeout)
         try:
-            job = typing.cast(Callable[[], object], pickler.loads(data))
+            job = job_fn
             try:
                 result = job()
             except Exception:

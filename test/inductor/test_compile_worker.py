@@ -518,6 +518,90 @@ class TestCompileWorkerWatchdog(TestCase):
         self.assertNotIn("phase", reports[-1])
         self.assertIn("elapsed_s", reports[-1])
 
+    @skipIfWindows(msg="pass_fds not supported on Windows.")
+    @config.patch(compile_worker_per_kernel_timeout=2)
+    def test_per_kernel_timeout_kills_worker(self):
+        # A job that outlives compile_worker_per_kernel_timeout must be hard-killed
+        # by the sidecar watchdog (not just soft-waited in the parent).
+        with patch.dict(
+            os.environ,
+            {"TORCHINDUCTOR_COMPILE_WORKER_WATCHDOG_INTERVAL": "1"},
+        ):
+            pool = SubprocPool(2)
+            try:
+                fut = pool.submit(time.sleep, 60)
+                with self.assertRaises(Exception):
+                    fut.result(timeout=30)
+                # Pool must recover after the kill (BrokenProcessPool recreate).
+                self.assertEqual(pool.submit(operator.add, 100, 1).result(), 101)
+            finally:
+                pool.shutdown()
+
+    @skipIfWindows(msg="pass_fds not supported on Windows.")
+    @config.patch(compile_worker_memory_limit_kb=1)
+    def test_memory_limit_kills_worker(self):
+        # A tiny per-worker PSS budget (1 kB) forces the watchdog to kill a
+        # live worker once heartbeats have claimed slots (idle Python workers
+        # already exceed 1 kB).
+        with patch.dict(
+            os.environ,
+            {"TORCHINDUCTOR_COMPILE_WORKER_WATCHDOG_INTERVAL": "1"},
+        ):
+            pool = SubprocPool(1)
+            try:
+                # Warm so workers claim heartbeat slots (PIDs needed for PSS).
+                self.assertEqual(pool.submit(operator.add, 1, 2).result(), 3)
+                fut = pool.submit(time.sleep, 60)
+                with self.assertRaises(Exception):
+                    fut.result(timeout=30)
+                self.assertEqual(pool.submit(operator.add, 2, 3).result(), 5)
+            finally:
+                pool.shutdown()
+
+    @skipIfWindows(msg="pass_fds not supported on Windows.")
+    @config.patch(compile_worker_per_kernel_timeout=3)
+    def test_timeout_kill_preserves_sibling_job(self):
+        with patch.dict(
+            os.environ,
+            {"TORCHINDUCTOR_COMPILE_WORKER_WATCHDOG_INTERVAL": "1"},
+        ):
+            pool = SubprocPool(2)
+            try:
+                self.assertEqual(pool.submit(operator.add, 1, 2).result(), 3)
+                self.assertEqual(pool.submit(operator.add, 3, 4).result(), 7)
+                offender = pool.submit(time.sleep, 60)
+                sibling = pool.submit(time.sleep, 1)
+                sibling.result(timeout=30)
+                with self.assertRaises(Exception):
+                    offender.result(timeout=30)
+                self.assertEqual(pool.submit(operator.add, 10, 20).result(), 30)
+            finally:
+                pool.shutdown()
+
+    @skipIfWindows(msg="pass_fds not supported on Windows.")
+    @config.patch(
+        compile_worker_memory_limit_kb=1024,
+        worker_start_method="fork",
+    )
+    def test_memory_limit_rejected_for_non_subprocess_pool(self):
+        from torch._inductor.async_compile import AsyncCompile
+
+        AsyncCompile.process_pool.cache_clear()
+        with self.assertRaisesRegex(RuntimeError, "worker_start_method='subprocess'"):
+            AsyncCompile.process_pool()
+
+    @skipIfWindows(msg="pass_fds not supported on Windows.")
+    @config.patch(
+        compile_worker_per_kernel_timeout=10,
+        worker_start_method="fork",
+    )
+    def test_timeout_limit_rejected_for_non_subprocess_pool(self):
+        from torch._inductor.async_compile import AsyncCompile
+
+        AsyncCompile.process_pool.cache_clear()
+        with self.assertRaisesRegex(RuntimeError, "worker_start_method='subprocess'"):
+            AsyncCompile.process_pool()
+
 
 class TestTimer(TestCase):
     def test_basics(self):
