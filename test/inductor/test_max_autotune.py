@@ -6059,8 +6059,6 @@ class TestTDMConfigDenseAndGeneric(TestCase):
         if not self._tdm_capable_triton():
             self.skipTest("Triton without gfx1250 TDM backend support")
 
-        import subprocess
-        import sys
         import textwrap
 
         child = textwrap.dedent(
@@ -6117,12 +6115,7 @@ class TestTDMConfigDenseAndGeneric(TestCase):
             print("<<<SEP>>>".join(outputs))
             """
         )
-        proc = subprocess.run(
-            [sys.executable, "-c", child],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
+        proc = run_triton_code_in_subprocess(child)
         if proc.returncode != 0:
             self.fail(proc.stderr.strip())
         parts = proc.stdout.split("<<<SEP>>>")
