@@ -11,6 +11,40 @@ inline float linspace_value(I i, constant array<float, 3>& v, I steps) {
                      : v[2] - v[1] * static_cast<float>(steps - i - 1);
 }
 
+template <typename T, typename I>
+inline T integral_linspace_value(
+    I i,
+    constant array<ulong, 4>& params,
+    I steps) {
+  // params = {start bits, end bits, distance quotient, distance remainder}.
+  const long start = as_type<long>(params[0]);
+  const long end = as_type<long>(params[1]);
+  const bool increasing = end >= start;
+  const ulong denominator = static_cast<ulong>(steps - 1);
+  const bool from_start = i < steps / 2;
+  const long base = from_start ? start : end;
+  const ulong position = static_cast<ulong>(from_start ? i : steps - i - 1);
+  ulong offset = params[2] * position;
+  bool has_fraction = false;
+  if (params[3] != 0) {
+    const ulong fractional_product = params[3] * position;
+    offset += fractional_product / denominator;
+    has_fraction = fractional_product % denominator != 0;
+  }
+  const bool add = from_start ? increasing : !increasing;
+  long value = as_type<long>(
+      add ? as_type<ulong>(base) + offset : as_type<ulong>(base) - offset);
+
+  if (has_fraction) {
+    if (add && value < 0) {
+      ++value;
+    } else if (!add && value > 0) {
+      --value;
+    }
+  }
+  return static_cast<T>(value);
+}
+
 // p = {steps, stride}.
 template <typename T, typename I>
 kernel void linspace(
@@ -20,6 +54,16 @@ kernel void linspace(
     uint index [[thread_position_in_grid]]) {
   const I i = static_cast<I>(index);
   out[i * p[1]] = c10::metal::cast_to<T>(linspace_value(i, v, p[0]));
+}
+
+template <typename T, typename I>
+kernel void linspace_integral(
+    device T* out [[buffer(0)]],
+    constant array<ulong, 4>& params [[buffer(1)]],
+    constant array<I, 2>& p [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+  const I i = static_cast<I>(index);
+  out[i * p[1]] = integral_linspace_value<T>(i, params, p[0]);
 }
 
 template <typename T>
@@ -168,12 +212,15 @@ REGISTER_LINSPACE_OP(float);
 REGISTER_LINSPACE_OP(half);
 REGISTER_LINSPACE_OP(bfloat);
 REGISTER_LINSPACE_OP(float2);
-REGISTER_LINSPACE_OP(long);
-REGISTER_LINSPACE_OP(int);
+REGISTER_LINSPACE_OP(bool);
 REGISTER_LINSPACE_OP(short);
 REGISTER_LINSPACE_OP(char);
 REGISTER_LINSPACE_OP(uchar);
-REGISTER_LINSPACE_OP(bool);
+REGISTER_LINSPACE_OP(long);
+REGISTER_LINSPACE_OP(int);
+
+REGISTER_INTEGRAL_LINSPACE_OP(long);
+REGISTER_INTEGRAL_LINSPACE_OP(int);
 
 REGISTER_LOGSPACE_OP(float);
 REGISTER_LOGSPACE_OP(half);
