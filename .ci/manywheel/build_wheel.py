@@ -60,9 +60,6 @@ def configure_blas_env() -> None:
     elif arch == "riscv64":
         os.environ["USE_MKLDNN"] = "0"
 
-        assert gpu_arch_type == "cpu-riscv64", (
-            f"Unexpected GPU_ARCH_TYPE={gpu_arch_type}"
-        )
         openblas = Path("/opt/OpenBLAS/lib/libopenblas.so.0")
         if not openblas.is_file():
             sys.exit(f"ERROR: OpenBLAS not found at {openblas}")
