@@ -369,22 +369,6 @@ if torch.backends.mps.is_available():
             # Failures due to lack of op implementation on MPS backend
             "linalg.eig": None,
             "linalg.eigvals": None,
-            # logspace int dtypes diverge from CPU: the MPS impl casts a float
-            # ramp, which rounds differently from CPU's integer computation
-            "logspace": [
-                torch.int8,
-                torch.uint8,
-                torch.int16,
-                torch.int32,
-                torch.int64,
-            ],
-            "logspacetensor_overload": [
-                torch.int8,
-                torch.uint8,
-                torch.int16,
-                torch.int32,
-                torch.int64,
-            ],
             "put": None,
             "frexp": None,
             "hash_tensor": None,

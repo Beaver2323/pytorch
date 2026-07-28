@@ -211,19 +211,73 @@ Tensor& linspace_out_mps(const Scalar& start, const Scalar& end, int64_t steps, 
 }
 
 Tensor& logspace_out_mps(const Scalar& start, const Scalar& end, int64_t steps, double base, Tensor& result) {
+  using namespace mps;
   TORCH_CHECK(steps >= 0, "number of steps must be non-negative");
   if (result.numel() != steps) {
     result.resize_({steps});
   }
   if (steps == 0) {
     return result;
-  } else if (steps == 1) {
+  }
+  if (steps == 1) {
     result.fill_(std::pow(base, start.to<double>()));
     return result;
   }
-  // Fill result with the linear ramp [start, end], then exponentiate.
-  linspace_out_mps(start, end, steps, result);
-  result.copy_(at::pow(base, result)); // in-place base ** x, elementwise
+
+  if (isComplexType(result.scalar_type())) {
+    linspace_out_mps(start, end, steps, result);
+    result.copy_(at::pow(base, result));
+    return result;
+  }
+
+  float s = 0, e = 0;
+  if (isIntegralType(result.scalar_type(), /*includeBool=*/false)) {
+    AT_DISPATCH_INTEGRAL_TYPES(result.scalar_type(), "logspace_mps", [&]() {
+      s = static_cast<float>(start.to<scalar_t>());
+      e = static_cast<float>(end.to<scalar_t>());
+    });
+  } else {
+    s = start.to<float>();
+    e = end.to<float>();
+  }
+
+  const std::array<float, 4> vals{s, (e - s) / static_cast<float>(steps - 1), e, static_cast<float>(base)};
+
+  auto stream = getCurrentMPSStream();
+  auto encoder = stream->commandEncoder();
+  const auto tname = scalarToMetalTypeString(result);
+  if (result.is_contiguous() || result.dim() == 1) {
+    const auto stride = result.is_contiguous() ? 1 : result.stride(0);
+    const auto abs_stride = stride < 0 ? -stride : stride;
+    const auto use32 = std::max<int64_t>(steps, (steps - 1) * abs_stride) <= std::numeric_limits<int32_t>::max();
+    auto pso = lib.getPipelineStateForFunc("logspace_" + tname + (use32 ? "_i32" : "_i64"));
+    dispatch_sync_with_rethrow(stream->queue(), ^() {
+      @autoreleasepool {
+        [encoder setComputePipelineState:pso];
+        if (use32) {
+          std::array<int32_t, 2> p{int32_t(steps), int32_t(stride)};
+          mtl_setArgs(encoder, result, vals, p);
+        } else {
+          std::array<int64_t, 2> p{steps, stride};
+          mtl_setArgs(encoder, result, vals, p);
+        }
+        mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(steps));
+      }
+    });
+  } else {
+    auto pso = lib.getPipelineStateForFunc("logspace_strided_" + tname);
+    const auto ndim = static_cast<int>(result.dim());
+    const std::vector<int64_t> sizes(result.sizes().rbegin(), result.sizes().rend());
+    const std::vector<int64_t> strides(result.strides().rbegin(), result.strides().rend());
+    const auto steps32 = static_cast<uint32_t>(steps);
+    dispatch_sync_with_rethrow(stream->queue(), ^() {
+      @autoreleasepool {
+        [encoder setComputePipelineState:pso];
+        mtl_setArgs(encoder, result, vals, steps32, ndim, sizes, strides);
+        mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(steps));
+      }
+    });
+  }
   return result;
 }
 

@@ -14088,7 +14088,6 @@ op_db: list[OpInfo] = [
            )),
     OpInfo('logspace',
            dtypes=all_types_and_complex_and(torch.half, torch.bfloat16),
-           dtypesIfMPS=all_types_and_complex_and(torch.half, torch.bfloat16),
            dtypesIfHpu=custom_types(torch.float32, torch.bfloat16),
            is_factory_function=True,
            supports_out=True,
