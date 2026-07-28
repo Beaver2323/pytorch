@@ -81,6 +81,20 @@ kernel void linspace_strided(
   out[off] = c10::metal::cast_to<T>(val);
 }
 
+template <typename T>
+kernel void linspace_integral_strided(
+    device T* out [[buffer(0)]],
+    constant array<ulong, 4>& params [[buffer(1)]],
+    constant uint& steps [[buffer(2)]],
+    constant int& ndim [[buffer(3)]],
+    constant long* sizes [[buffer(4)]],
+    constant long* strides [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+  const long off =
+      c10::metal::offset_from_thread_index(index, sizes, strides, ndim);
+  out[off] = integral_linspace_value<T>(index, params, steps);
+}
+
 // Same halfway split as linspace_value (exact endpoints), then base ** exponent.
 template <typename I>
 inline float logspace_value(I i, constant array<float, 4>& v, I steps) {
@@ -161,6 +175,29 @@ kernel void arange_strided(
       constant int& ndim [[buffer(3)]],                          \
       constant long* sizes [[buffer(4)]],                        \
       constant long* strides [[buffer(5)]],                      \
+      uint index [[thread_position_in_grid]]);
+
+#define REGISTER_INTEGRAL_LINSPACE_OP(DTYPE)                              \
+  template [[host_name("linspace_integral_" #DTYPE "_i32")]] kernel void  \
+  linspace_integral<DTYPE, int>(                                          \
+      device DTYPE * out [[buffer(0)]],                                   \
+      constant array<ulong, 4> & params [[buffer(1)]],                    \
+      constant array<int, 2> & p [[buffer(2)]],                           \
+      uint index [[thread_position_in_grid]]);                            \
+  template [[host_name("linspace_integral_" #DTYPE "_i64")]] kernel void  \
+  linspace_integral<DTYPE, long>(                                         \
+      device DTYPE * out [[buffer(0)]],                                   \
+      constant array<ulong, 4> & params [[buffer(1)]],                    \
+      constant array<long, 2> & p [[buffer(2)]],                          \
+      uint index [[thread_position_in_grid]]);                            \
+  template [[host_name("linspace_integral_strided_" #DTYPE)]] kernel void \
+  linspace_integral_strided<DTYPE>(                                       \
+      device DTYPE * out [[buffer(0)]],                                   \
+      constant array<ulong, 4> & params [[buffer(1)]],                    \
+      constant uint & steps [[buffer(2)]],                                \
+      constant int& ndim [[buffer(3)]],                                   \
+      constant long* sizes [[buffer(4)]],                                 \
+      constant long* strides [[buffer(5)]],                               \
       uint index [[thread_position_in_grid]]);
 
 #define REGISTER_LOGSPACE_OP(DTYPE)                              \
