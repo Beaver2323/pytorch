@@ -95,7 +95,8 @@ kernel void linspace_integral_strided(
   out[off] = integral_linspace_value<T>(index, params, steps);
 }
 
-// Same halfway split as linspace_value (exact endpoints), then base ** exponent.
+// Same halfway split as linspace_value (exact endpoints), then base **
+// exponent.
 template <typename I>
 inline float logspace_value(I i, constant array<float, 4>& v, I steps) {
   const I halfway = steps / 2;
@@ -112,6 +113,10 @@ kernel void logspace(
     constant array<I, 2>& p [[buffer(2)]],
     uint index [[thread_position_in_grid]]) {
   const I i = static_cast<I>(index);
+  float val = logspace_value(i, v, p[0]);
+  if (::metal::is_integral_v<T>) {
+    val = ::metal::rint(val);
+  }
   out[i * p[1]] = c10::metal::cast_to<T>(logspace_value(i, v, p[0]));
 }
 
@@ -124,7 +129,10 @@ kernel void logspace_strided(
     constant long* sizes [[buffer(4)]],
     constant long* strides [[buffer(5)]],
     uint index [[thread_position_in_grid]]) {
-  const float val = logspace_value(index, v, steps);
+  float val = logspace_value(index, v, steps);
+  if (::metal::is_integral_v<T>) {
+    val = ::metal::rint(val);
+  }
   const long off =
       c10::metal::offset_from_thread_index(index, sizes, strides, ndim);
   out[off] = c10::metal::cast_to<T>(val);
