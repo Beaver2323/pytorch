@@ -256,6 +256,25 @@ class OpsHandler(Generic[T]):
         """
         raise NotImplementedError
 
+    def masked_store(
+        self,
+        name: str,
+        index: sympy.Expr,
+        value: T,
+        mask: T,
+    ) -> None:
+        """
+        Store 'value' to 'name' offset by 'index', but only where 'mask' is
+        true. Elements where 'mask' is false are left *unmodified*, so this op
+        only partially initializes 'name': whatever those elements held before
+        is what they still hold. Analyses must not assume a masked store
+        defines the full extent of 'index'.
+
+        Unlike 'store' there is no 'mode' -- an atomic masked store is not
+        supported, so backends never need to combine a mask with atomic_add.
+        """
+        raise NotImplementedError
+
     # TODO: Better explain how the "collective" semantics of these ops;
     # remember that the input value is a scalar, you can't reduce on it in the
     # traditional sense!
@@ -1210,6 +1229,9 @@ class SimpleCSEHandler(WrapperHandler):
 
     def store(self, *args, **kwargs) -> None:
         raise NotImplementedError("store not implemented")
+
+    def masked_store(self, *args, **kwargs) -> None:
+        raise NotImplementedError("masked_store not implemented")
 
     def store_reduction(self, *args, **kwargs) -> None:
         raise NotImplementedError("store not implemented")
