@@ -1884,9 +1884,8 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         """
         ROCm specific filtering
         """
-        if not self.uses_tdm_configs:
-            for c in configs:
-                c.num_stages = self.default_num_stages
+        for c in configs:
+            c.num_stages = self.default_num_stages
         return super()._filter_configs(configs)
 
     def _finalize_mm_configs(
@@ -2333,7 +2332,7 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
             # have to drop its best picks at compile time (Triton OutOfResources
             # is not always caught on the HIP backend). Check against
             # self.default_num_stages because ROCmConfigHeuristic._filter_configs
-            # (triton.py:1728) clobbers num_stages to that value downstream.
+            # normalizes num_stages to that value downstream.
             lds_check = self._get_exceeding_shared_memory_checker(False, 0)
             exhaustive = self.exhaustive_configs
             if lds_check is not None:
@@ -2438,10 +2437,9 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
                     max_warps,
                     max(1, tile_area // (mfma_dim * warp_size)),
                 )
-                # num_stages: ROCmConfigHeuristic._filter_configs (triton.py:1728)
-                # overwrites this to self.default_num_stages, so seed with that
-                # value to keep the in-flight GemmConfig consistent with the
-                # post-filter state.
+                # ROCmConfigHeuristic._filter_configs normalizes num_stages to
+                # self.default_num_stages, so seed with that value to keep the
+                # in-flight GemmConfig consistent with the post-filter state.
                 base_config = GemmConfig(
                     block_m=cfg.mt.m,
                     block_n=cfg.mt.n,
