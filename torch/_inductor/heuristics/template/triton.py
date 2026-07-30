@@ -2469,7 +2469,7 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
                 )
                 pruned = origami_config_count - len(origami_configs)
                 if pruned:
-                    log.debug(
+                    log.info(
                         "Origami: pruned %d/%d selected configs failing "
                         "TDM descriptor alignment",
                         pruned,
