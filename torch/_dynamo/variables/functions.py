@@ -472,8 +472,6 @@ class BaseUserFunctionVariable(VariableTracker):
             return ConstantVariable.create(
                 val, source=self.source and AttrSource(self.source, name)
             )
-        elif name == "__dict__":
-            return fn_dict
         elif name == "__annotations__":
             return fn_dict.getitem_or_default(
                 name,
@@ -491,6 +489,7 @@ class BaseUserFunctionVariable(VariableTracker):
                 ),
             )
         else:
+            # TODO(dynamo-team): This should be done in super().getattro_impl
             if fn_dict.contains(name):
                 return fn_dict.getitem(name)
             else:
@@ -1760,6 +1759,13 @@ class UserMethodVariable(UserFunctionVariable):
             # information is stored in self.source_fn, use that to construct the
             # variable tracker.
             return VariableTracker.build(tx, self.fn, self.source_fn)  # type: ignore[arg-type]
+        if name == "__dict__":
+            # A bound method has no instance dict of its own; method_getattro
+            # forwards anything the method type does not define to __func__.
+            from .object_protocol import generic_getattr
+
+            func = VariableTracker.build(tx, self.fn, self.source_fn)  # type: ignore[arg-type]
+            return generic_getattr(tx, func, name)
         return super().getattro_impl(tx, name)
 
     def get_real_python_backed_value(self) -> Any:

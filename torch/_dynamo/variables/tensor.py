@@ -698,15 +698,6 @@ class TensorVariable(VariableTracker):
                     f"Unknown property {name} during speculating backward, dynamo will insert contiguous call ahead and speculate it again"
                 )
 
-        if name == "__class__":
-            # Carry provenance on the class, mirroring BuiltinVariable.call_type.
-            # A sourced class self-guards when observed downstream (e.g.
-            # `w.__class__ is SomeType`), which keeps type observation sound even
-            # when the input's own class guard is relaxed (see
-            # VariableBuilder.wrap_tensor and ACT input polymorphism).
-            source = self.source and TypeSource(self.source)
-            return VariableTracker.build(tx, self.python_type(), source)
-
         handler = getattr(self, f"method_attr_{name}", None)
         result = handler(tx) if handler is not None else None
 
