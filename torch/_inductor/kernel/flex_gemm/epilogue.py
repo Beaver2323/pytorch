@@ -82,6 +82,7 @@ from torch._inductor.kernel.gemm_epilogue import (
     GemmEpilogueGraph,
     iter_fx_node_inputs,
     NormalizedGetItem,
+    NormalizedNVFP4Pack,
     NormalizedPrepareSoftmax,
     NormalizedReduction,
     NormalizedSelect,
@@ -90,6 +91,7 @@ from torch._inductor.kernel.gemm_epilogue import (
     NormalizedUnsupportedReduction,
     NormalizedView,
 )
+from torch._inductor.kernel.gemm_epilogue_utils import statically_known_equal
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.value_ranges import ValueRanges
@@ -917,8 +919,9 @@ def match_grouped_main_lane(
 ) -> GroupedMainLaneMatch | None:
     """Normalize one supported grouped-N output spelling.
 
-    The accepted leaves are ``split(...)[i]`` for chunked lanes and
-    ``view(...).select(..., i)`` for interleaved or chunked lanes.
+    The accepted leaves are ``split(...)[i]`` for chunked lanes,
+    ``view(...).select(..., i)`` for interleaved or chunked lanes, and
+    ``nvfp4_pack(view(...))`` for the two interleaved packed lanes.
     """
     if gemm_shape is None:
         return None
@@ -956,6 +959,30 @@ def match_grouped_main_lane(
             indices=(normalized.index,),
             layout_node=split,
             structural_values=(split_size,),
+        )
+
+    if isinstance(normalized, NormalizedNVFP4Pack):
+        grouped = normalized.source
+        view_normalized = local_reduce.graph.normalized_nodes.get(grouped)
+        shape = tensor_meta_shape(grouped)
+        group = 2
+        if (
+            not isinstance(view_normalized, NormalizedView)
+            or shape is None
+            or len(shape) != 3
+            or not statically_known_equal(shape[-1], group)
+            or not statically_known_shape_equal(
+                (shape[0], shape[1] * group), gemm_shape
+            )
+            or not local_reduce.graph.depends_on(view_normalized.source, gemm)
+        ):
+            return None
+        return GroupedMainLaneMatch(
+            source=view_normalized.source,
+            group=group,
+            chunked=False,
+            indices=tuple(range(group)),
+            layout_node=grouped,
         )
 
     if not isinstance(normalized, NormalizedSelect):
@@ -1619,6 +1646,7 @@ class FlexGemmEpilogueEmitter:
             ")\n"
             "from torch._inductor.kernel.flex_gemm.quant_intrinsics import (\n"
             "    mx_e8m0_scale_intrinsic,\n"
+            "    nvfp4_pack_intrinsic,\n"
             ")\n\n"
             f"{local_reduce_source}"
             f"@cute.jit\ndef {name}({epilogue_params}):\n"

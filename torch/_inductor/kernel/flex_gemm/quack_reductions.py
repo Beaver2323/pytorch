@@ -421,6 +421,12 @@ def _cute_call(target: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> An
         # The HOP spells the asm text `asm_str`; the ops handler spells it `asm`.
         kwargs = dict(kwargs)
         kwargs["asm"] = kwargs.pop("asm_str")
+    if op_name == "nvfp4_pack":
+        return V.kernel.cse.generate(
+            V.kernel.body,
+            f"nvfp4_pack_intrinsic({args[0]})",
+            dtype=torch.uint8,
+        )
     try:
         op = getattr(V.get_ops_handler(), op_name)
     except AttributeError:
