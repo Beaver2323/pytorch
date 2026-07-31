@@ -32,7 +32,12 @@ from typing import Any, cast, Protocol, TYPE_CHECKING, TypeAlias
 import torch
 from torch._custom_class_base import CustomClassBase
 from torch._dynamo.utils import counters, get_runtime_metrics_context
-from torch._guards import compile_context, CompileContext
+from torch._guards import (
+    active_fake_mode,
+    compile_context,
+    CompileContext,
+    detect_fake_mode,
+)
 from torch._higher_order_ops.wrap import inductor_compiled_code
 from torch._inductor.cudagraph_utils import (
     BoxedDeviceIndex,
@@ -57,9 +62,17 @@ from torch._inductor.utils import (
     output_node,
     set_tracing_context_output_strides,
 )
+from torch._subclasses.fake_tensor import (
+    allow_non_fake_inputs_for_compiled_region,
+    FakeTensor,
+    get_plain_tensors,
+)
 from torch.fx._graph_pickler import _node_metadata_key_filter_safe, _ops_filter_safe
 from torch.utils._ordered_set import OrderedSet
-from torch.utils._python_dispatch import is_in_torch_dispatch_mode
+from torch.utils._python_dispatch import (
+    is_in_torch_dispatch_mode,
+    is_traceable_wrapper_subclass,
+)
 
 from . import config
 from .runtime.autotune_cache import AutotuneCacheBundler
@@ -96,6 +109,45 @@ if TYPE_CHECKING:
 
 
 log = logging.getLogger(__name__)
+
+
+def _has_fake_mode_for_compiled_region(inputs: Sequence[Any]) -> bool:
+    has_fake_mode = active_fake_mode() is not None
+    if not has_fake_mode:
+        for input in inputs:
+            if isinstance(input, FakeTensor):  # noqa: ISINSTANCE_FAKE_TENSOR
+                has_fake_mode = True
+                break
+            if is_traceable_wrapper_subclass(input):
+                plain_tensors: list[
+                    torch.Tensor | int | torch.SymInt | CustomClassBase
+                ] = []
+                get_plain_tensors(input, out=plain_tensors)
+                for plain_tensor in plain_tensors:
+                    if isinstance(plain_tensor, FakeTensor):  # noqa: ISINSTANCE_FAKE_TENSOR
+                        has_fake_mode = True
+                        break
+            if has_fake_mode:
+                break
+    if not has_fake_mode:
+        return False
+
+    plain_tensors: list[torch.Tensor | int | torch.SymInt | CustomClassBase] = []
+    for input in inputs:
+        if isinstance(input, torch.Tensor):
+            if is_traceable_wrapper_subclass(input):
+                get_plain_tensors(input, out=plain_tensors)
+            else:
+                plain_tensors.append(input)
+
+    if plain_tensors:
+        raise AssertionError(
+            "Inductor compiled regions cannot run directly with tensor inputs "
+            "in FakeTensorMode. Use real tensor inputs outside FakeTensorMode. "
+            f"Found input {plain_tensors[0]}"
+        )
+
+    return True
 
 
 @dataclasses.dataclass
@@ -815,17 +867,28 @@ class CompiledFxGraph(OutputCode):
         # while its saved compile context is restored, then clear the saved
         # context after leaving the compile_context manager.
         try:
+            # The HOP wrapper has its own FakeTensor propagation path. The
+            # direct compiled callable can only run under FakeTensorMode when
+            # it has no tensor inputs and only needs to fakify internal buffers.
+            use_fake_mode_context = False
+            if not (self._wrap_compiled_regions and is_in_torch_dispatch_mode()):
+                use_fake_mode_context = _has_fake_mode_for_compiled_region(inputs)
             with autotune_cache_context:
                 try:
-                    # Checking the profiler directly is faster than nullcontext
-                    if torch.autograd.profiler._is_profiler_enabled:
-                        with torch._C._profiler._RecordFunctionFast(
-                            f"## Call CompiledFxGraph {self._fx_graph_cache_key} ##",
-                            keyword_values={"scope": "user_scope"},
-                        ):
+                    with (
+                        contextlib.nullcontext()
+                        if not use_fake_mode_context
+                        else allow_non_fake_inputs_for_compiled_region()
+                    ):
+                        # Checking the profiler directly is faster than nullcontext
+                        if torch.autograd.profiler._is_profiler_enabled:
+                            with torch._C._profiler._RecordFunctionFast(
+                                f"## Call CompiledFxGraph {self._fx_graph_cache_key} ##",
+                                keyword_values={"scope": "user_scope"},
+                            ):
+                                return self.current_callable(inputs)
+                        else:
                             return self.current_callable(inputs)
-                    else:
-                        return self.current_callable(inputs)
                 finally:
                     get_runtime_metrics_context().finish()
                     if has_active_autotune_cache_bundler:
@@ -1301,7 +1364,6 @@ class RegionalOutputCode(OutputCode):
         if self._serialized_graph_module is None:
             raise AssertionError("self._serialized_graph_module must not be None")
         # Get fake mode from example inputs
-        from torch._guards import detect_fake_mode
 
         fake_mode = detect_fake_mode(example_inputs)
         if fake_mode is None:

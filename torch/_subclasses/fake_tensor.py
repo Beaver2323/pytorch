@@ -196,14 +196,37 @@ class FakeTensorTLS(threading.local):
     # Default to None, otherwise it'll be used to override _all_
     # `FakeTensorMode.allow_non_fake_inputs` in this thread.
     allow_non_fake_inputs_override: bool | None
+    # Managed by allow_non_fake_inputs_for_compiled_region when compiler-owned
+    # scalar buffers must remain data-dependent during fakification.
+    _suppress_real_tensor_item_memo: bool
     non_strict_export_fake_tensor_tracker: weakref.WeakSet[FakeTensor]
 
     def __init__(self) -> None:
         self.allow_non_fake_inputs_override = None
+        self._suppress_real_tensor_item_memo = False
         self.non_strict_export_fake_tensor_tracker = weakref.WeakSet()
 
 
 fake_tensor_tls = FakeTensorTLS()
+
+
+@contextlib.contextmanager
+def allow_non_fake_inputs_for_compiled_region() -> Generator[None, None, None]:
+    """Fakify compiler-created tensors without treating scalar buffers as constants.
+
+    Callers must ensure user-provided tensor inputs cannot enter this dynamic scope.
+    """
+    old_allow_non_fake_inputs = fake_tensor_tls.allow_non_fake_inputs_override
+    old_suppress_real_tensor_item_memo = fake_tensor_tls._suppress_real_tensor_item_memo
+    fake_tensor_tls.allow_non_fake_inputs_override = True
+    fake_tensor_tls._suppress_real_tensor_item_memo = True
+    try:
+        yield
+    finally:
+        fake_tensor_tls.allow_non_fake_inputs_override = old_allow_non_fake_inputs
+        fake_tensor_tls._suppress_real_tensor_item_memo = (
+            old_suppress_real_tensor_item_memo
+        )
 
 
 def ordered_set(*items: T) -> dict[T, Literal[True]]:
@@ -586,6 +609,7 @@ class FakeTensorConverter:
         value = None
         if (
             not self.export
+            and not fake_tensor_tls._suppress_real_tensor_item_memo
             and _is_plain_tensor(t)  # mostly, we want to know if item() works
             and t.dim() == 0
             and t.device.type == "cpu"
