@@ -1275,6 +1275,7 @@ class FlexGemmEpilogueEmitter:
         epilogue_arg_placeholders: tuple[torch.fx.Node, ...] = (),
         *,
         fast_math: bool = False,
+        swap_ab: bool = False,
     ) -> None:
         self.graph_module = graph_module
         self.epilogue_arg_placeholders = epilogue_arg_placeholders
@@ -1289,14 +1290,21 @@ class FlexGemmEpilogueEmitter:
                 "acc", ValueRanges.unknown(), dtype=torch.float32, shape=(1,)
             )
         }
+
         self.grouped_tensors = {
             node: GroupedTensorSSALayout(
-                group=grouped.layout.group, axis=grouped.layout.axis
+                group=grouped.layout.group,
+                axis=grouped.layout.axis,
+                swapped=swap_ab,
             )
             for node, grouped in analysis.local_reduce.grouped_layouts.items()
         }
         self.active_grouped_layouts = OrderedSet(
-            GroupedTensorSSALayout(group=geometry.group, axis=geometry.axis)
+            GroupedTensorSSALayout(
+                group=geometry.group,
+                axis=geometry.axis,
+                swapped=swap_ab,
+            )
             for geometry in analysis.required_geometries
         )
         self.store_sources: dict[torch.fx.Node, Any] = {}
@@ -1671,6 +1679,7 @@ def materialize_flex_gemm_epilogue(
     epilogue_arg_placeholders: tuple[torch.fx.Node, ...] = (),
     *,
     fast_math: bool = False,
+    swap_ab: bool = False,
 ) -> tuple[str, str]:
     """Materialize an analyzed FlexGEMM body as generated CuTeDSL source.
 
@@ -1697,4 +1706,5 @@ def materialize_flex_gemm_epilogue(
         analysis,
         epilogue_arg_placeholders,
         fast_math=fast_math,
+        swap_ab=swap_ab,
     ).materialize()
