@@ -21,11 +21,11 @@ kernel void unique_mark_boundaries(
 // scan[] is the inclusive scan of the mask, so scan[i]-1 is the 0-indexed
 // unique-group ID. Each group ID is written by exactly one thread (the
 // boundary thread), so there is no contention.
-template <typename T, typename SCAN_T>
+template <typename T>
 kernel void unique_emit(
     constant T* sorted [[buffer(0)]],
     constant int* mask [[buffer(1)]],
-    constant SCAN_T* scan [[buffer(2)]],
+    constant long* scan [[buffer(2)]],
     device T* unique_values [[buffer(3)]],
     device long* bound_pos [[buffer(4)]],
     uint tid [[thread_position_in_grid]]) {
@@ -49,36 +49,26 @@ kernel void unique_counts(
 
 // inverse[sort_idx[k]] = scan[k] - 1.
 // sort_idx is a permutation of [0, N) so writes are conflict-free.
-template <typename SCAN_T>
 kernel void unique_inverse(
     constant long* sort_idx [[buffer(0)]],
-    constant SCAN_T* scan [[buffer(1)]],
+    constant long* scan [[buffer(1)]],
     device long* inverse [[buffer(2)]],
     uint tid [[thread_position_in_grid]]) {
   inverse[sort_idx[tid]] = long(scan[tid]) - 1;
 }
 
-#define REGISTER_UNIQUE_FOR_T(T, NAME)                                \
-  template [[host_name("unique_mark_boundaries_" #NAME)]] kernel void \
-  unique_mark_boundaries<T>(                                          \
-      constant T * sorted [[buffer(0)]],                              \
-      device int* mask [[buffer(1)]],                                 \
-      uint tid [[thread_position_in_grid]]);                          \
-  template [[host_name("unique_emit_" #NAME "_32")]] kernel void      \
-  unique_emit<T, int>(                                                \
-      constant T * sorted [[buffer(0)]],                              \
-      constant int* mask [[buffer(1)]],                               \
-      constant int* scan [[buffer(2)]],                               \
-      device T* unique_values [[buffer(3)]],                          \
-      device long* bound_pos [[buffer(4)]],                           \
-      uint tid [[thread_position_in_grid]]);                          \
-  template [[host_name("unique_emit_" #NAME "_64")]] kernel void      \
-  unique_emit<T, long>(                                               \
-      constant T * sorted [[buffer(0)]],                              \
-      constant int* mask [[buffer(1)]],                               \
-      constant long* scan [[buffer(2)]],                              \
-      device T* unique_values [[buffer(3)]],                          \
-      device long* bound_pos [[buffer(4)]],                           \
+#define REGISTER_UNIQUE_FOR_T(T, NAME)                                     \
+  template [[host_name("unique_mark_boundaries_" #NAME)]] kernel void      \
+  unique_mark_boundaries<T>(                                               \
+      constant T * sorted [[buffer(0)]],                                   \
+      device int* mask [[buffer(1)]],                                      \
+      uint tid [[thread_position_in_grid]]);                               \
+  template [[host_name("unique_emit_" #NAME)]] kernel void unique_emit<T>( \
+      constant T * sorted [[buffer(0)]],                                   \
+      constant int* mask [[buffer(1)]],                                    \
+      constant long* scan [[buffer(2)]],                                   \
+      device T* unique_values [[buffer(3)]],                               \
+      device long* bound_pos [[buffer(4)]],                                \
       uint tid [[thread_position_in_grid]]);
 
 REGISTER_UNIQUE_FOR_T(float, float)
@@ -90,15 +80,3 @@ REGISTER_UNIQUE_FOR_T(short, short)
 REGISTER_UNIQUE_FOR_T(char, char)
 REGISTER_UNIQUE_FOR_T(uchar, uchar)
 REGISTER_UNIQUE_FOR_T(bool, bool)
-
-template [[host_name("unique_inverse_32")]] kernel void unique_inverse<int>(
-    constant long* sort_idx [[buffer(0)]],
-    constant int* scan [[buffer(1)]],
-    device long* inverse [[buffer(2)]],
-    uint tid [[thread_position_in_grid]]);
-
-template [[host_name("unique_inverse_64")]] kernel void unique_inverse<long>(
-    constant long* sort_idx [[buffer(0)]],
-    constant long* scan [[buffer(1)]],
-    device long* inverse [[buffer(2)]],
-    uint tid [[thread_position_in_grid]]);

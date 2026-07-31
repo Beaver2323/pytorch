@@ -333,12 +333,10 @@ static std::tuple<Tensor, Tensor, Tensor> _unique_flat_mps_fast(const Tensor& se
     }
   });
 
-  // cumsum runs as a separate dispatch on MPS; that's fine.
+  // cumsum runs as a separate dispatch on MPS; that's fine. at::cumsum
+  // promotes the int32 mask to int64, so scan is always kLong.
   scan = at::cumsum(mask, /*dim=*/0);
-  // cumsum of int32 may upcast to int64 on some paths; track the scan dtype.
-  const auto scan_dtype = scan.scalar_type();
-  TORCH_CHECK(scan_dtype == kInt || scan_dtype == kLong, "unique: unexpected cumsum output dtype ", scan_dtype);
-  const auto scan_suffix = std::to_string(c10::elementSize(scan_dtype) * 8);
+  TORCH_INTERNAL_ASSERT(scan.scalar_type() == kLong);
 
   // Step 4: read num_unique.
   const int64_t num_unique = scan.select(0, numel - 1).item<int64_t>();
@@ -356,8 +354,7 @@ static std::tuple<Tensor, Tensor, Tensor> _unique_flat_mps_fast(const Tensor& se
     @autoreleasepool {
       id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
       {
-        id<MTLComputePipelineState> pso =
-            lib.getPipelineStateForFunc(fmt::format("unique_emit_{}_{}", type_name, scan_suffix));
+        id<MTLComputePipelineState> pso = lib.getPipelineStateForFunc(fmt::format("unique_emit_{}", type_name));
         getMPSProfiler().beginProfileKernel(pso, "unique_emit", false);
         [encoder setComputePipelineState:pso];
         mtl_setArgs(encoder, sorted_values, mask, scan, unique_values, bound_pos);
@@ -378,7 +375,7 @@ static std::tuple<Tensor, Tensor, Tensor> _unique_flat_mps_fast(const Tensor& se
       // consecutive, the inverse is just (scan - 1), which we compute as a
       // tensor op outside this block to avoid re-entering the queue.
       if (return_inverse && !consecutive) {
-        id<MTLComputePipelineState> pso = lib.getPipelineStateForFunc(fmt::format("unique_inverse_{}", scan_suffix));
+        id<MTLComputePipelineState> pso = lib.getPipelineStateForFunc("unique_inverse");
         getMPSProfiler().beginProfileKernel(pso, "unique_inverse", false);
         [encoder setComputePipelineState:pso];
         mtl_setArgs(encoder, sort_idx, scan, inverse);
