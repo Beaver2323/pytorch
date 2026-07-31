@@ -256,10 +256,12 @@ class GemmLocalReduceAnalysis:
         source_shape = (
             tensor_meta_shape(source) if isinstance(source, torch.fx.Node) else None
         )
-        layout = grouped_tensor_layout(shape, source_shape)
-        if layout is None or not isinstance(source, torch.fx.Node):
+        grouped_layout = grouped_tensor_layout(shape, source_shape)
+        if grouped_layout is None or not isinstance(source, torch.fx.Node):
             return False
-        self.grouped_tensors[node] = layout
+        grouped_layout.commit_guards()
+        layout = grouped_layout.layout
+        self.grouped_tensors[node] = GroupedTensorSSALayout(layout.group, layout.axis)
         return True
 
     def propagate_local_reduce_match(self, node: torch.fx.Node, source: Any) -> bool:
@@ -506,7 +508,7 @@ class GemmLocalReduceAnalysis:
         if not isinstance(normalized, NormalizedView):
             return None
         source_node = normalized.source
-        layout = grouped_tensor_layout(normalized.shape, tensor_meta_shape(source_node))
+        layout = self.grouped_tensors.get(grouped_source)
         if layout is None:
             return None
         if layout.axis != 0:

@@ -14,6 +14,8 @@ from torch._inductor.kernel.gemm_epilogue import (
     NormalizedGetItem,
     NormalizedPrepareSoftmax,
     NormalizedReduction,
+    NormalizedSelect,
+    NormalizedSplit,
     NormalizedSqueeze,
     NormalizedUnsupportedReduction,
     NormalizedView,
@@ -140,6 +142,14 @@ def _format_geometry(geometry: Any) -> str:
     return f"axis={axis}, group={geometry.group}"
 
 
+def _format_main_transform(transform: Any | None) -> str:
+    """Format the logical contraction applied to the main output."""
+    if transform is None:
+        return "none"
+    layout = "chunked" if transform.chunked else "interleaved"
+    return f"grouped-N, group={transform.group}, layout={layout}"
+
+
 def _format_normalized_dataflow(node: torch.fx.Node, normalized: Any) -> str:
     """Render one normalized FX operation as compact dataflow."""
     match normalized:
@@ -157,6 +167,10 @@ def _format_normalized_dataflow(node: torch.fx.Node, normalized: Any) -> str:
             operation = "squeeze"
         case NormalizedGetItem(index=index):
             operation = f"getitem(index={index})"
+        case NormalizedSplit(split_size=split_size, dim=dim):
+            operation = f"split(size={split_size}, dim={dim})"
+        case NormalizedSelect(dim=dim, index=index):
+            operation = f"select(dim={dim}, index={index})"
         case NormalizedUnsupportedReduction():
             operation = f"unsupported_reduction({node.target})"
         case _:
@@ -169,7 +183,8 @@ def format_flex_gemm_analysis(analysis: "FlexGemmEpilogueAnalysis") -> str:
     outputs = analysis.outputs
     lines = [
         "outputs:",
-        f"  main: {_format_fx_tensor(outputs.output)}",
+        f"  main: {_format_fx_tensor(outputs.main)}",
+        f"  main_transform: {_format_main_transform(outputs.main_transform)}",
     ]
     if outputs.aux_outputs:
         lines.append("  auxiliary:")
@@ -231,8 +246,9 @@ def format_flex_gemm_analysis_details(
     lines: list[str] = []
     for label, values in (
         ("normalized_nodes", analysis.local_reduce.graph.normalized_nodes),
-        ("grouped_tensors", analysis.local_reduce.grouped_tensors),
+        ("grouped_layouts", analysis.local_reduce.grouped_layouts),
         ("local_reduce_matches", analysis.local_reduce.matches),
+        ("grouped_select_indices", analysis.grouped_select_indices),
     ):
         _append_items(
             lines,
@@ -251,7 +267,8 @@ def _format_tensor_meta(meta: torch.Tensor) -> str:
 
 
 def format_flex_gemm_lowering_plan(
-    output_size: Sequence[Any],
+    logical_output_size: Sequence[Any],
+    physical_output_size: Sequence[Any],
     output_dtype: torch.dtype,
     capture_kinds: Sequence[tuple[str, str]],
     aux_metas: Sequence[torch.Tensor],
@@ -260,7 +277,8 @@ def format_flex_gemm_lowering_plan(
     """Render buffer allocation and runtime-ABI decisions."""
     lines = [
         "output_storage:",
-        f"  shape={tuple(output_size)}, dtype={output_dtype}",
+        f"  logical: shape={tuple(logical_output_size)}, dtype={output_dtype}",
+        f"  physical: shape={tuple(physical_output_size)}",
         "",
     ]
     _append_items(

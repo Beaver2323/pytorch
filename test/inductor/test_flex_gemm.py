@@ -14,6 +14,7 @@ from unittest import mock
 import torch
 from torch._higher_order_ops import flex_gemm
 from torch._higher_order_ops.flex_gemm import _SUPPORTED_FLEX_GEMM_OP_NAMES
+from torch._inductor.exc import InductorError
 from torch._inductor.ops_handler import ReductionType
 from torch._inductor.utils import run_and_get_code
 from torch.testing import FileCheck
@@ -371,7 +372,7 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def body(x):
-            grouped = x.view(4, 2, 4)
+            grouped = x.view(4, 4, 2)
             reduced = grouped.sum(dim=-1, keepdim=True)
             maximum = torch.max(grouped, dim=-1).values
             return reduced.squeeze(-1), maximum, grouped.var(dim=-1)
@@ -398,7 +399,7 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         )
         squeeze = nodes[torch.ops.aten.squeeze.dim]
         unsupported = nodes[torch.ops.aten.var.correction]
-        self.assertEqual(normalized_nodes[view], NormalizedView(placeholder, (4, 2, 4)))
+        self.assertEqual(normalized_nodes[view], NormalizedView(placeholder, (4, 4, 2)))
         self.assertEqual(
             normalized_nodes[reduction],
             NormalizedReduction(view, [-1], True, None, "sum"),
@@ -411,6 +412,29 @@ class TestFlexGemmRuntimeHelpers(TestCase):
                 view,
                 str(torch.ops.aten.var.correction),
             ),
+        )
+
+    def test_local_reduce_propagates_before_grouped_view_matching(self):
+        from torch._inductor.kernel.flex_gemm.epilogue import (
+            FlexGemmLocalReduceAnalysis,
+        )
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        def body(x):
+            grouped = x.view(4, 6, 2)
+            reduced = grouped.sum(dim=-1, keepdim=True).squeeze(-1)
+            return reduced.view(-1, 4, 3)
+
+        graph_module = make_fx(body)(torch.randn(4, 12))
+        analysis = FlexGemmLocalReduceAnalysis.from_graph_module(graph_module)
+        output = next(
+            node for node in graph_module.graph.nodes if node.op == "output"
+        ).args[0]
+        self.assertIsInstance(output, torch.fx.Node)
+        self.assertIn(output, analysis.matches)
+        self.assertEqual(
+            analysis.matches[output].value_node.target,
+            torch.ops.aten.sum.dim_IntList,
         )
 
     def test_dense_config_selection_is_explicit_and_sm110_reuses_sm100(self):
@@ -543,6 +567,149 @@ class TestFlexGemmRuntimeHelpers(TestCase):
                     torch.device("cuda")
                 )
 
+    def test_grouped_main_output_device_validation(self):
+        from torch._inductor.kernel.flex_gemm.constraints import (
+            FlexGemmGroupedMainOutputTransform,
+        )
+
+        group_2 = FlexGemmGroupedMainOutputTransform(2)
+        group_4 = FlexGemmGroupedMainOutputTransform(4)
+        for capability in (10, 11):
+            group_2.validate_quack(capability)
+        group_4.validate_quack(10)
+        with self.assertRaisesRegex(NotImplementedError, "group 4 on SM100"):
+            group_4.validate_quack(11)
+        with self.assertRaisesRegex(NotImplementedError, "not yet supported on SM120"):
+            group_2.validate_quack(12)
+        with self.assertRaisesRegex(NotImplementedError, "only on SM100 and SM110"):
+            group_2.validate_quack(9)
+        with self.assertRaisesRegex(NotImplementedError, "only on SM100 and SM110"):
+            group_4.validate_quack(9)
+
+    @skipIfNoCuteDSL
+    def test_quack_grouped_main_output_device_validation(self):
+        from torch._vendor.quack.gemm_act import validate_grouped_n_contract_device
+
+        validate_grouped_n_contract_device(2, (10, 0))
+        validate_grouped_n_contract_device(2, (11, 0))
+        validate_grouped_n_contract_device(4, (10, 0))
+        with self.assertRaisesRegex(NotImplementedError, "group 2.*group 4"):
+            validate_grouped_n_contract_device(4, (11, 0))
+        with self.assertRaisesRegex(NotImplementedError, "not yet supported on SM120"):
+            validate_grouped_n_contract_device(2, (12, 0))
+        with self.assertRaisesRegex(NotImplementedError, "only on SM100 and SM110"):
+            validate_grouped_n_contract_device(2, (9, 0))
+
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    def test_runtime_grouped_main_rejects_unsafe_explicit_config(self):
+        from torch._inductor.kernel.flex_gemm.constraints import (
+            FlexGemmGroupedMainOutputTransform,
+        )
+        from torch._inductor.kernel.flex_gemm.runtime import (
+            FlexGemmRuntimeOutputPlan,
+            gemm_epilogue,
+        )
+
+        config = SimpleNamespace(
+            swap_ab=True,
+            cluster_m=1,
+            tile_m=128,
+            cluster_n=1,
+            tile_n=16,
+        )
+        with (
+            mock.patch(
+                "torch._inductor.heuristics.template.flex_gemm.candidate_gemm_configs_for_device",
+                return_value=[config],
+            ),
+            mock.patch(
+                "torch._inductor.heuristics.template.flex_gemm.gemm_config_from_key",
+                return_value=config,
+            ),
+            self.assertRaisesRegex(NotImplementedError, "incompatible with grouped"),
+        ):
+            gemm_epilogue(
+                torch.randn(4, 8, device="cuda"),
+                torch.randn(8, 16, device="cuda"),
+                lambda acc: acc,
+                "unsafe_grouped_main_config",
+                output_plan=FlexGemmRuntimeOutputPlan(
+                    main_transform=FlexGemmGroupedMainOutputTransform(2)
+                ),
+                config_key=(("swap_ab", True),),
+                expected_ndim=2,
+                device_capacity_override=(10, 0),
+            )
+
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    def test_runtime_chunked_grouped_main_rejects_contiguous_b(self):
+        from torch._inductor.kernel.flex_gemm.constraints import (
+            FlexGemmGroupedMainOutputTransform,
+        )
+        from torch._inductor.kernel.flex_gemm.runtime import (
+            FlexGemmRuntimeOutputPlan,
+            gemm_epilogue,
+        )
+
+        with self.assertRaisesRegex(
+            NotImplementedError, "output dimension to be non-contiguous"
+        ):
+            gemm_epilogue(
+                torch.randn(4, 8, device="cuda"),
+                torch.randn(8, 16, device="cuda"),
+                lambda acc: acc,
+                "chunked_contiguous_b",
+                output_plan=FlexGemmRuntimeOutputPlan(
+                    main_transform=FlexGemmGroupedMainOutputTransform(2, chunked=True)
+                ),
+                device_capacity_override=(10, 0),
+            )
+
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    def test_runtime_grouped_main_selects_safe_default_config(self):
+        from torch._inductor.kernel.flex_gemm.constraints import (
+            FlexGemmGroupedMainOutputTransform,
+        )
+        from torch._inductor.kernel.flex_gemm.runtime import (
+            FlexGemmRuntimeOutputPlan,
+            gemm_epilogue,
+        )
+
+        unsafe = SimpleNamespace(
+            swap_ab=True,
+            cluster_m=1,
+            tile_m=128,
+            cluster_n=1,
+            tile_n=16,
+        )
+        safe = SimpleNamespace(
+            swap_ab=False,
+            cluster_m=1,
+            tile_m=128,
+            cluster_n=1,
+            tile_n=16,
+        )
+        with (
+            mock.patch(
+                "torch._inductor.heuristics.template.flex_gemm.candidate_gemm_configs_for_device",
+                return_value=[unsafe, safe],
+            ),
+            mock.patch(
+                "torch._inductor.kernel.flex_gemm.runtime.dispatch_gemm_act"
+            ) as dispatch,
+        ):
+            gemm_epilogue(
+                torch.randn(4, 8, device="cuda"),
+                torch.randn(8, 16, device="cuda"),
+                lambda acc: acc,
+                "safe_grouped_main_config",
+                output_plan=FlexGemmRuntimeOutputPlan(
+                    main_transform=FlexGemmGroupedMainOutputTransform(2)
+                ),
+                device_capacity_override=(10, 0),
+            )
+        self.assertIs(dispatch.call_args.kwargs["config"], safe)
+
     def test_explicit_dense_config_supports_partial_constraints(self):
         from torch._inductor.heuristics.template import (
             flex_gemm as flex_gemm_heuristics,
@@ -550,9 +717,7 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         from torch._inductor.kernel.flex_gemm.constraints import (
             FlexGemmLocalReduceGeometry,
         )
-        from torch._inductor.kernel.flex_gemm.lowering import (
-            flex_gemm_config_keys_for_local_reduce,
-        )
+        from torch._inductor.kernel.flex_gemm.lowering import flex_gemm_config_keys
         from torch._inductor.virtualized import V
         from torch._vendor.quack.gemm_config import GemmConfig
 
@@ -589,7 +754,7 @@ class TestFlexGemmRuntimeHelpers(TestCase):
                 (supported, alternative),
             )
             self.assertEqual(
-                flex_gemm_config_keys_for_local_reduce(
+                flex_gemm_config_keys(
                     device,
                     128,
                     128,
@@ -600,7 +765,7 @@ class TestFlexGemmRuntimeHelpers(TestCase):
                 (flex_gemm_heuristics.gemm_config_key(supported),),
             )
             self.assertEqual(
-                flex_gemm_config_keys_for_local_reduce(
+                flex_gemm_config_keys(
                     device,
                     128,
                     128,
@@ -648,7 +813,7 @@ class TestFlexGemmRuntimeHelpers(TestCase):
                 NotImplementedError, "incompatible with local reduction"
             ),
         ):
-            flex_gemm_config_keys_for_local_reduce(
+            flex_gemm_config_keys(
                 device,
                 128,
                 128,
@@ -1569,6 +1734,7 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         )
         from torch._inductor.kernel.flex_gemm.runtime import (
             FlexGemmRuntimeLocalReducePlan,
+            FlexGemmRuntimeOutputPlan,
             gemm_epilogue,
         )
 
@@ -1588,9 +1754,11 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
                 self.relu_epilogue,
                 "test_flex_gemm_swap_ab_local_reduce_rejects",
                 out_dtype=torch.float32,
-                local_reduce=FlexGemmRuntimeLocalReducePlan(
-                    FlexGemmLocalReduceGeometry(group, 1),
-                    out=local_reduce_out,
+                output_plan=FlexGemmRuntimeOutputPlan(
+                    local_reduce=FlexGemmRuntimeLocalReducePlan(
+                        FlexGemmLocalReduceGeometry(group, 1),
+                        out=local_reduce_out,
+                    )
                 ),
                 config_key=swap_key,
             )
@@ -1692,6 +1860,7 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         )
         from torch._inductor.kernel.flex_gemm.runtime import (
             FlexGemmRuntimeLocalReducePlan,
+            FlexGemmRuntimeOutputPlan,
             gemm_epilogue,
         )
 
@@ -1732,7 +1901,7 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
                     f"{config.tile_m}_{config.tile_n}_{config.cluster_m}_{config.cluster_n}"
                 ),
                 out_dtype=torch.float32,
-                local_reduce=local_reduce,
+                output_plan=FlexGemmRuntimeOutputPlan(local_reduce=local_reduce),
                 config_key=gemm_config_key(config),
             )
             torch.testing.assert_close(out.double(), expected, atol=1e-4, rtol=1e-4)
@@ -1888,7 +2057,10 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_swap_ab_captured_args_tuple_aux_matches_non_swap(self):
-        from torch._inductor.kernel.flex_gemm.runtime import gemm_epilogue
+        from torch._inductor.kernel.flex_gemm.runtime import (
+            FlexGemmRuntimeOutputPlan,
+            gemm_epilogue,
+        )
 
         torch.manual_seed(10)
         m, n, k = 128, 384, 256
@@ -1908,7 +2080,7 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
                 self.captured_tuple_aux_epilogue,
                 name,
                 out=out,
-                aux_outs=(aux,),
+                output_plan=FlexGemmRuntimeOutputPlan(aux_outs=(aux,)),
                 epilogue_args=(col_bias, row_scale, tile_bias),
                 epilogue_arg_kinds=("col", "row", "tile"),
                 config_key=config_key,
@@ -1962,7 +2134,10 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_epilogue_writes_tuple_aux_out(self):
-        from torch._inductor.kernel.flex_gemm.runtime import gemm_epilogue
+        from torch._inductor.kernel.flex_gemm.runtime import (
+            FlexGemmRuntimeOutputPlan,
+            gemm_epilogue,
+        )
 
         torch.manual_seed(8)
         m, n, k = 128, 128, 64
@@ -1983,7 +2158,7 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
             "test_flex_gemm_tuple_aux",
             out_dtype=torch.float32,
             out=out,
-            aux_outs=(aux,),
+            output_plan=FlexGemmRuntimeOutputPlan(aux_outs=(aux,)),
         )
 
         self.assertIs(actual, out)
@@ -3002,6 +3177,7 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
         self.assertIn("outputs:\n  main: relu: shape=(4, 64)", analysis_report)
         self.assertIn("auxiliary: (none)", analysis_report)
+        self.assertIn("main_transform: none", analysis_report)
         self.assertIn("value: sum_1", analysis_report)
         self.assertIn("dataflow: view -> sum(dim=[-1], keepdim=False)", analysis_report)
         self.assertIn("geometry: axis=N, group=32", analysis_report)
@@ -3012,8 +3188,9 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         self.assertNotIn("normalized_nodes:", analysis_report)
         self.assertIn("normalized_nodes:\n  view: NormalizedView", analysis_details)
         self.assertIn("sum_1: NormalizedReduction", analysis_details)
-        self.assertIn("grouped_tensors:\n  view:", analysis_details)
+        self.assertIn("grouped_layouts:\n  view:", analysis_details)
         self.assertIn("local_reduce_matches:\n  sum_1:", analysis_details)
+        self.assertIn("grouped_select_indices:\n  (none)", analysis_details)
         self.assertIn("tile_m: 256", config_report)
         self.assertIn("tile_k: auto", config_report)
         self.assertIn("cluster_m: 2", config_report)
@@ -3033,6 +3210,35 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
                 "analysis_details", lambda: analysis_details, verbose=True
             )
         self.assertIn(" ===== ANALYSIS DETAILS =====", records.output[0])
+
+    def test_grouped_main_debug_report(self):
+        from torch._inductor.kernel.flex_gemm.debug import (
+            format_flex_gemm_analysis,
+            format_flex_gemm_analysis_details,
+        )
+        from torch._inductor.kernel.flex_gemm.epilogue import (
+            analyze_flex_gemm_epilogue,
+            gemm_node,
+        )
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        def body(a, b):
+            grouped = torch.mm(a, b).view(4, 8, 2)
+            return grouped.select(-1, 0) - grouped.select(-1, 1)
+
+        graph_module = make_fx(body)(torch.randn(4, 8), torch.randn(8, 16))
+        analysis = analyze_flex_gemm_epilogue(
+            graph_module, gemm_node(graph_module, torch.ops.aten.mm.default)
+        )
+
+        self.assertIn(
+            "main_transform: grouped-N, group=2, layout=interleaved",
+            format_flex_gemm_analysis(analysis),
+        )
+        details = format_flex_gemm_analysis_details(analysis)
+        self.assertIn("NormalizedSelect", details)
+        self.assertIn("grouped_select_indices:", details)
+        self.assertNotIn("grouped_select_indices:\n  (none)", details)
 
     @skipIfNoCuteDSL
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
@@ -3097,6 +3303,273 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         self.assertIn("@cute.jit", verbose_report)
         self.assertIn("candidate 0:", verbose_report)
 
+    def test_grouped_layout_rejects_inexact_inferred_preserved_dimension(self):
+        from torch._inductor.kernel.flex_gemm.quack_reductions import (
+            grouped_tensor_layout,
+        )
+
+        with self.assertRaisesRegex(
+            NotImplementedError, "grouped reshape must split exactly"
+        ):
+            grouped_tensor_layout((-1, 2, 2), (4, 5))
+
+    @parametrize("unbacked_dim", (1, 2))
+    def test_grouped_layout_rejects_unbacked_structural_dimensions(self, unbacked_dim):
+        from torch._inductor.kernel.flex_gemm.quack_reductions import (
+            grouped_tensor_layout,
+        )
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        shape = [4, -1, 2]
+        shape[unbacked_dim] = ShapeEnv().create_unbacked_symint()
+        self.assertIsNone(grouped_tensor_layout(tuple(shape), (4, 8)))
+
+    def test_grouped_layout_rejected_backed_group_does_not_guard(self):
+        from torch._dynamo.source import ConstantSource
+        from torch._inductor.kernel.flex_gemm.quack_reductions import (
+            grouped_tensor_layout,
+        )
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        shape_env = ShapeEnv()
+        symbol = shape_env.create_symbol(3, ConstantSource("group"))
+        group = shape_env.create_symintnode(symbol, hint=3)
+
+        self.assertIsNone(grouped_tensor_layout((4, 5, group), (4, 8)))
+        self.assertEqual(shape_env.guards, [])
+
+    def test_grouped_main_output_recognizer_only_mutates_analysis_on_match(self):
+        """Rejected recognitions must not leak grouped layouts or guards."""
+        from torch._dynamo.source import ConstantSource
+        from torch._inductor.kernel.flex_gemm.constraints import (
+            FlexGemmGroupedMainOutputTransform,
+        )
+        from torch._inductor.kernel.flex_gemm.epilogue import (
+            analyze_flex_gemm_epilogue,
+            gemm_node,
+        )
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        def swap_halves_plus_acc(a, b):
+            acc = torch.mm(a, b)
+            halves = acc.chunk(2, dim=-1)
+            return torch.cat((halves[1], halves[0]), dim=-1) + acc
+
+        def silu_mul_halves(a, b):
+            acc = torch.mm(a, b)
+            halves = acc.chunk(2, dim=-1)
+            return torch.nn.functional.silu(halves[0]) * halves[1]
+
+        chunked_transform = FlexGemmGroupedMainOutputTransform(group=2, chunked=True)
+        for body, expected_transform in (
+            (swap_halves_plus_acc, None),
+            (silu_mul_halves, chunked_transform),
+        ):
+            with self.subTest(body=body.__name__):
+                graph_module = make_fx(body)(torch.randn(4, 8), torch.randn(8, 16))
+                shape_env = ShapeEnv()
+                symbol = shape_env.create_symbol(
+                    8, ConstantSource(f"{body.__name__}_split_size")
+                )
+                split_size = shape_env.create_symintnode(symbol, hint=8)
+                for node in graph_module.graph.nodes:
+                    if node.target is torch.ops.aten.split.Tensor:
+                        node.args = (node.args[0], split_size, node.args[2])
+                analysis = analyze_flex_gemm_epilogue(
+                    graph_module, gemm_node(graph_module, torch.ops.aten.mm.default)
+                )
+                split_nodes = [
+                    node
+                    for node in graph_module.graph.nodes
+                    if node.target is torch.ops.aten.split.Tensor
+                ]
+                self.assertTrue(split_nodes)
+                self.assertEqual(analysis.outputs.main_transform, expected_transform)
+                registered = [
+                    node
+                    for node in split_nodes
+                    if node in analysis.local_reduce.grouped_layouts
+                ]
+                self.assertEqual(registered, split_nodes if expected_transform else [])
+                self.assertEqual(len(shape_env.guards), 1 if expected_transform else 0)
+
+    def test_rejected_grouped_select_does_not_install_index_guard(self):
+        from torch._dynamo.source import ConstantSource
+        from torch._inductor.kernel.flex_gemm.epilogue import (
+            analyze_flex_gemm_epilogue,
+            gemm_node,
+        )
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        def duplicate_grouped_lane(a, b):
+            grouped = torch.mm(a, b).view(4, 4, 4)
+            return torch.cat(
+                (
+                    grouped.select(-1, 0),
+                    grouped.select(-1, 1),
+                    grouped.select(-1, 2),
+                    grouped.select(-1, 2),
+                ),
+                dim=-1,
+            )
+
+        graph_module = make_fx(duplicate_grouped_lane)(
+            torch.randn(4, 8), torch.randn(8, 16)
+        )
+        shape_env = ShapeEnv()
+        index_symbol = shape_env.create_symbol(2, ConstantSource("select_index"))
+        index = shape_env.create_symintnode(index_symbol, hint=2)
+        group_symbol = shape_env.create_symbol(4, ConstantSource("view_group"))
+        group = shape_env.create_symintnode(group_symbol, hint=4)
+        self.assertIsInstance(index, torch.SymInt)
+        self.assertIsInstance(group, torch.SymInt)
+        view = next(
+            node
+            for node in graph_module.graph.nodes
+            if node.target is torch.ops.aten.view.default
+        )
+        view.args = (view.args[0], (4, 4, group))
+        select = next(
+            node
+            for node in graph_module.graph.nodes
+            if node.target is torch.ops.aten.select.int and node.args[2] == 2
+        )
+        select.args = (select.args[0], select.args[1], index)
+
+        with self.assertRaisesRegex(NotImplementedError, "complete grouped main"):
+            analyze_flex_gemm_epilogue(
+                graph_module, gemm_node(graph_module, torch.ops.aten.mm.default)
+            )
+        self.assertEqual(shape_env.guards, [])
+
+    @parametrize("pointwise", (False, True))
+    def test_accepted_grouped_reduction_installs_group_guard(self, pointwise):
+        from torch._dynamo.source import ConstantSource
+        from torch._inductor.kernel.flex_gemm.epilogue import (
+            analyze_flex_gemm_epilogue,
+            gemm_node,
+        )
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        def grouped_reduction(a, b):
+            grouped = torch.mm(a, b).view(4, 8, 2)
+            source = grouped + 1 if pointwise else grouped
+            reduced = source.sum(-1, keepdim=True)
+            return (grouped / reduced).view(4, 16)
+
+        graph_module = make_fx(grouped_reduction)(torch.randn(4, 8), torch.randn(8, 16))
+        shape_env = ShapeEnv()
+        symbol = shape_env.create_symbol(2, ConstantSource("view_group"))
+        group = shape_env.create_symintnode(symbol, hint=2)
+        self.assertIsInstance(group, torch.SymInt)
+        view = next(
+            node
+            for node in graph_module.graph.nodes
+            if node.target is torch.ops.aten.view.default
+            and tuple(node.meta["val"].shape) == (4, 8, 2)
+        )
+        view.args = (view.args[0], (4, 8, group))
+
+        analyze_flex_gemm_epilogue(
+            graph_module, gemm_node(graph_module, torch.ops.aten.mm.default)
+        )
+        self.assertEqual(len(shape_env.guards), 1)
+
+    def test_active_grouped_layout_installs_own_structural_guard(self):
+        from torch._dynamo.source import ConstantSource
+        from torch._inductor.kernel.flex_gemm.epilogue import (
+            analyze_flex_gemm_epilogue,
+            gemm_node,
+        )
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        def grouped_reduction_with_sibling(a, b):
+            acc = torch.mm(a, b)
+            sibling = acc.view(4, 8, 2)
+            reduced = acc.view(4, 8, 2).sum(-1, keepdim=True)
+            return (sibling * reduced).view(4, 16)
+
+        graph_module = make_fx(grouped_reduction_with_sibling)(
+            torch.randn(4, 8), torch.randn(8, 16)
+        )
+        reduction = next(
+            node
+            for node in graph_module.graph.nodes
+            if node.target is torch.ops.aten.sum.dim_IntList
+        )
+        sibling_view = next(
+            node
+            for node in graph_module.graph.nodes
+            if node.target is torch.ops.aten.view.default
+            and node is not reduction.args[0]
+            and tuple(node.meta["val"].shape) == (4, 8, 2)
+        )
+        shape_env = ShapeEnv()
+        symbol = shape_env.create_symbol(2, ConstantSource("sibling_group"))
+        group = shape_env.create_symintnode(symbol, hint=2)
+        self.assertIsInstance(group, torch.SymInt)
+        sibling_view.args = (sibling_view.args[0], (4, 8, group))
+
+        analyze_flex_gemm_epilogue(
+            graph_module, gemm_node(graph_module, torch.ops.aten.mm.default)
+        )
+        self.assertEqual(len(shape_env.guards), 1)
+
+    def test_grouped_main_output_does_not_contract_other_axes(self):
+        from torch._inductor.kernel.flex_gemm.epilogue import (
+            analyze_flex_gemm_epilogue,
+            gemm_node,
+        )
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        def reassemble_row_pairs(a, b):
+            acc = torch.mm(a, b)
+            rows = acc.view(2, 2, 16)
+            return torch.cat((rows.select(1, 0), rows.select(1, 1)), dim=0)
+
+        def split_grouped_view(a, b):
+            acc = torch.mm(a, b)
+            chunks = acc.view(4, 8, 2).split(1, dim=1)
+            pair = (chunks[0] - chunks[1]).reshape(4, 2)
+            return pair.repeat(1, 8)
+
+        for body in (reassemble_row_pairs, split_grouped_view):
+            with self.subTest(body=body.__name__):
+                graph_module = make_fx(body)(torch.randn(4, 8), torch.randn(8, 16))
+                analysis = analyze_flex_gemm_epilogue(
+                    graph_module, gemm_node(graph_module, torch.ops.aten.mm.default)
+                )
+                self.assertIsNone(analysis.outputs.main_transform)
+
+    @skipIfNoCuteDSL
+    def test_grouped_main_output_rejects_column_major_out(self):
+        """Reject layouts that the grouped tile-store descriptor cannot represent."""
+        from torch._vendor.quack.gemm_act import gemm_act
+
+        a = torch.empty(4, 8)
+        b = torch.empty(8, 16)
+        out = torch.empty_strided((4, 8), (1, 4))
+        with self.assertRaisesRegex(NotImplementedError, "PostAct to be n-major"):
+            gemm_act(
+                a,
+                b,
+                None,
+                None,
+                out,
+                None,
+                None,
+                128,
+                128,
+                1,
+                1,
+                tensor_epilogue_fn=lambda acc: acc,
+                main_output_transform_group=2,
+            )
+
     @skipIfNoCuteDSL
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
@@ -3149,6 +3622,526 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             (a.double() @ b.double()) + 1.0,
             k,
         )
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipIf(not SM100OrLater, "SM100+ required")
+    @unittest.skipIf(SM120OrLater, "grouped-N main outputs are not supported on SM120")
+    @parametrize(
+        "operation,tuned",
+        (
+            ("silu_mul", False),
+            ("sub", False),
+            ("uint8_sub", False),
+            ("silu_mul", True),
+        ),
+    )
+    def test_mm_grouped_n_main_output_compiled_matches_reference(
+        self, operation, tuned
+    ):
+        m, k, n, group = 64, 64, 64, 2
+
+        def epilogue(acc):
+            gate = acc.float().view(m, n, group)[..., 0]
+            up = acc.float().view(m, n, group)[..., 1]
+            match operation:
+                case "silu_mul":
+                    return (torch.nn.functional.silu(gate) * up).to(acc.dtype)
+                case "sub":
+                    return (gate - up).to(acc.dtype)
+                case "uint8_sub":
+                    return (gate - up).to(torch.uint8)
+
+        def fn(a, b):
+            return flex_gemm(
+                torch.mm,
+                (a, b),
+                epilogue,
+                kernel_options={"backend": "QUACK", "tuned": tuned},
+            )
+
+        if operation == "uint8_sub":
+            a = torch.eye(m, k, device="cuda", dtype=torch.float16)
+            columns = torch.arange(group * n, device="cuda")
+            pair = (columns // group) % 8
+            b = torch.where(columns % group == 0, 3 * pair + 2, pair)
+            b = b.expand(k, -1).contiguous().to(torch.float16)
+        else:
+            a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+            b = torch.randn(k, group * n, device="cuda", dtype=torch.float16)
+        actual, (code,) = run_and_get_code(
+            torch.compile(fn, backend="inductor", fullgraph=True), a, b
+        )
+
+        expected = fn(a, b)
+        if operation == "uint8_sub":
+            self.assertEqual(actual, expected)
+        else:
+            torch.testing.assert_close(actual, expected, atol=1e-1, rtol=1e-1)
+        self.assertEqual(actual.shape, (m, n))
+        FileCheck().check("FlexGemmGroupedMainOutputTransform(group=2").check_not(
+            "activation="
+        ).check_not("extern_kernels.mm").run(code)
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
+        "interleaved group 4 is currently validated only on SM100",
+    )
+    def test_mm_grouped_main_output_group4(self):
+        m, k, n, group = 64, 64, 64, 4
+
+        def epilogue(acc):
+            lanes = acc.float().view(m, n, group)
+            return (
+                lanes[..., 0]
+                + 2 * lanes[..., 1]
+                + 3 * lanes[..., 2]
+                + 5 * lanes[..., 3]
+            ).to(acc.dtype)
+
+        def fn(a, b):
+            return flex_gemm(
+                torch.mm,
+                (a, b),
+                epilogue,
+                kernel_options={"backend": "QUACK"},
+            )
+
+        a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+        b = torch.randn(k, group * n, device="cuda", dtype=torch.float16)
+        actual, (code,) = run_and_get_code(
+            torch.compile(fn, backend="inductor", fullgraph=True), a, b
+        )
+
+        torch.testing.assert_close(actual, fn(a, b), atol=2e-1, rtol=5e-2)
+        self.assertEqual(actual.shape, (m, n))
+        FileCheck().check(
+            "FlexGemmGroupedMainOutputTransform(group=4, chunked=False)"
+        ).check_not("extern_kernels.mm").run(code)
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipIf(not SM100OrLater, "SM100+ required")
+    @unittest.skipIf(SM120OrLater, "grouped-N main outputs are not supported on SM120")
+    @parametrize("chunked", (False, True))
+    def test_mm_grouped_n_main_output_dynamic_m(self, chunked):
+        k = n = 64
+
+        def epilogue(acc):
+            value = acc.float()
+            if chunked:
+                gate, up = value.chunk(2, dim=-1)
+            else:
+                lanes = value.view(-1, n, 2)
+                gate, up = lanes[..., 0], lanes[..., 1]
+            return (torch.nn.functional.silu(gate) * up).to(acc.dtype)
+
+        def fn(a, b):
+            return flex_gemm(
+                torch.mm,
+                (a, b),
+                epilogue,
+                kernel_options={"backend": "QUACK"},
+            )
+
+        b = torch.randn(2 * n, k, device="cuda", dtype=torch.float16)
+        b = b.t() if chunked else b.t().contiguous()
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        for index, m in enumerate((64, 128)):
+            a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+            if index == 0:
+                torch._dynamo.mark_dynamic(a, 0)
+            torch.testing.assert_close(compiled(a, b), fn(a, b), atol=1e-1, rtol=1e-1)
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipIf(not SM100OrLater, "SM100+ required")
+    @unittest.skipIf(SM120OrLater, "grouped-N main outputs are not supported on SM120")
+    @parametrize("chunked", (False, True))
+    def test_mm_grouped_n_main_output_partial_n_tile(self, chunked):
+        m = k = 64
+        n = 80
+
+        def epilogue(acc):
+            value = acc.float()
+            if chunked:
+                lhs, rhs = value.chunk(2, dim=-1)
+            else:
+                lanes = value.view(m, n, 2)
+                lhs, rhs = lanes[..., 0], lanes[..., 1]
+            return (lhs - rhs).to(acc.dtype)
+
+        def fn(a, b):
+            return flex_gemm(
+                torch.mm,
+                (a, b),
+                epilogue,
+                kernel_options={
+                    "backend": "QUACK",
+                    "config": {"tile_n": 128, "cluster_n": 1, "swap_ab": False},
+                },
+            )
+
+        a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+        b = (
+            torch.randn(2 * n, k, device="cuda", dtype=torch.float16).t()
+            if chunked
+            else torch.randn(k, 2 * n, device="cuda", dtype=torch.float16)
+        )
+        actual, (code,) = run_and_get_code(
+            torch.compile(fn, backend="inductor", fullgraph=True), a, b
+        )
+        torch.testing.assert_close(actual, epilogue(a @ b), atol=0.2, rtol=0.05)
+        FileCheck().check("FlexGemmGroupedMainOutputTransform(group=2").check(
+            "('tile_n', 128)"
+        ).check_not("extern_kernels.mm").run(code)
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipIf(not SM100OrLater, "SM100+ required")
+    @unittest.skipIf(SM120OrLater, "grouped-N main outputs are not supported on SM120")
+    @parametrize("use_chunk", (False, True))
+    def test_mm_grouped_n_main_output_concat_layout(self, use_chunk):
+        m, k, n = 64, 64, 64
+
+        def epilogue(acc):
+            value = acc.float()
+            if use_chunk:
+                gate, up = value.chunk(2, dim=-1)
+            else:
+                lanes = value.view(m, 2, n)
+                gate, up = lanes.select(-2, -2), lanes.select(-2, -1)
+            return (torch.nn.functional.silu(gate) * up).to(acc.dtype)
+
+        def fn(a, b):
+            return flex_gemm(
+                torch.mm,
+                (a, b),
+                epilogue,
+                kernel_options={"backend": "QUACK"},
+            )
+
+        a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+        b = torch.randn(2 * n, k, device="cuda", dtype=torch.float16).t()
+        actual, (code,) = run_and_get_code(
+            torch.compile(fn, backend="inductor", fullgraph=True), a, b
+        )
+
+        torch.testing.assert_close(actual, fn(a, b), atol=2e-1, rtol=2e-2)
+        FileCheck().check("FlexGemmGroupedMainOutputTransform(group=2").check(
+            "chunked=True"
+        ).check_not("activation=").check_not("extern_kernels.mm").run(code)
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipIf(not SM100OrLater, "SM100+ required")
+    @unittest.skipIf(SM120OrLater, "grouped-N main outputs are not supported on SM120")
+    @parametrize("indices", ((0, 1), (1, 0), (-1, -2)))
+    def test_mm_grouped_n_main_output_specializes_select_indices(self, indices):
+        torch._dynamo.reset()
+        m = k = n = 64
+        first, second = indices
+
+        def epilogue(acc):
+            lanes = acc.float().view(m, n, 2)
+            return (lanes.select(-1, first) - lanes.select(-1, second)).to(acc.dtype)
+
+        def fn(a, b):
+            return flex_gemm(
+                torch.mm,
+                (a, b),
+                epilogue,
+                kernel_options={"backend": "QUACK"},
+            )
+
+        a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+        b = torch.randn(k, 2 * n, device="cuda", dtype=torch.float16)
+        actual, (code,) = run_and_get_code(
+            torch.compile(fn, backend="inductor", fullgraph=True), a, b
+        )
+        torch.testing.assert_close(actual, epilogue(a @ b), atol=0.2, rtol=0.05)
+        FileCheck().check("FlexGemmGroupedMainOutputTransform(group=2").check_not(
+            "extern_kernels.mm"
+        ).run(code)
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipIf(not SM100OrLater, "SM100+ required")
+    @unittest.skipIf(SM120OrLater, "grouped-N main outputs are not supported on SM120")
+    @parametrize("split_size", (64, 128))
+    def test_mm_grouped_n_main_output_specializes_split_size(self, split_size):
+        torch._dynamo.reset()
+        m = k = 64
+
+        def epilogue(acc):
+            lanes = acc.float().split(split_size, dim=-1)
+            return (lanes[0] - lanes[1]).to(acc.dtype)
+
+        def fn(a, b):
+            return flex_gemm(
+                torch.mm,
+                (a, b),
+                epilogue,
+                kernel_options={"backend": "QUACK"},
+            )
+
+        a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+        b = torch.randn(2 * split_size, k, device="cuda", dtype=torch.float16).t()
+        torch._dynamo.mark_static(b, 1)
+        actual, (code,) = run_and_get_code(
+            torch.compile(fn, backend="inductor", fullgraph=True), a, b
+        )
+        torch.testing.assert_close(actual, epilogue(a @ b), atol=0.2, rtol=0.05)
+        FileCheck().check("FlexGemmGroupedMainOutputTransform(group=2").check(
+            "chunked=True"
+        ).check_not("extern_kernels.mm").run(code)
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipIf(not SM100OrLater, "SM100+ required")
+    @unittest.skipIf(SM120OrLater, "grouped-N main outputs are not supported on SM120")
+    def test_mm_grouped_n_main_output_supports_clustered_m_configs(self):
+        from torch._vendor.quack.gemm_config import GemmConfig
+
+        m, k, n, group = 256, 64, 128, 2
+        tile_m = 256
+
+        def epilogue(acc):
+            lanes = acc.float().view(m, n, group)
+            return (torch.nn.functional.silu(lanes[..., 0]) * lanes[..., 1]).to(
+                acc.dtype
+            )
+
+        config = dataclasses.asdict(
+            GemmConfig(
+                tile_m=tile_m,
+                tile_n=256,
+                pingpong=False,
+                cluster_m=2,
+                cluster_n=1,
+                device_capacity=10,
+            )
+        )
+
+        def fn(a, b):
+            return flex_gemm(
+                torch.mm,
+                (a, b),
+                epilogue,
+                kernel_options={"backend": "QUACK", "config": config},
+            )
+
+        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(k, group * n, device="cuda", dtype=torch.bfloat16)
+        actual, (code,) = run_and_get_code(
+            torch.compile(fn, backend="inductor", fullgraph=True), a, b
+        )
+
+        self.assertMatchesLowPrecisionEager(
+            actual,
+            epilogue(a @ b),
+            epilogue(a.double() @ b.double()),
+            k,
+        )
+        FileCheck().check("FlexGemmGroupedMainOutputTransform(group=2").check(
+            f"('tile_m', {tile_m})"
+        ).check("('cluster_m', 2)").run(code)
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipIf(not SM100OrLater, "SM100+ required")
+    @unittest.skipIf(SM120OrLater, "grouped-N main outputs are not supported on SM120")
+    def test_grouped_n_main_output_filters_unsafe_configs(self):
+        from torch._inductor.heuristics.template.flex_gemm import (
+            candidate_gemm_configs_for_device,
+            gemm_config_from_key,
+            gemm_config_key,
+        )
+        from torch._inductor.kernel.flex_gemm.constraints import (
+            FlexGemmGroupedMainOutputTransform,
+            FlexGemmLocalReduceGeometry,
+        )
+        from torch._inductor.kernel.flex_gemm.lowering import flex_gemm_config_keys
+
+        device = torch.device("cuda")
+        candidates = candidate_gemm_configs_for_device(device)
+        self.assertTrue(
+            any(
+                config.tile_n > 128 or config.cluster_m > 1 or config.cluster_n > 1
+                for config in candidates
+            )
+        )
+        configs = tuple(
+            gemm_config_from_key(key)
+            for key in flex_gemm_config_keys(
+                device,
+                64,
+                128,
+                (FlexGemmLocalReduceGeometry(group=2, axis=1),),
+                tuned=True,
+                main_transform=FlexGemmGroupedMainOutputTransform(group=2),
+            )
+        )
+        self.assertTrue(configs)
+        self.assertTrue(
+            all(
+                config.tile_n <= 128
+                and config.cluster_n == 1
+                and (
+                    config.cluster_m == 1
+                    or (config.tile_m == 256 and config.cluster_m == 2)
+                )
+                for config in configs
+            )
+        )
+        unsafe_config = next(
+            config
+            for config in candidates
+            if config.tile_n > 128
+            or config.cluster_n > 1
+            or (config.cluster_m > 1 and config.tile_m != 256)
+        )
+        with self.assertRaisesRegex(
+            NotImplementedError, "incompatible with grouped main output"
+        ):
+            flex_gemm_config_keys(
+                device,
+                64,
+                128,
+                (),
+                tuned=True,
+                main_transform=FlexGemmGroupedMainOutputTransform(group=2),
+                explicit_config=dict(gemm_config_key(unsafe_config)),
+            )
+        with mock.patch("torch.cuda.get_device_capability", return_value=(12, 0)):
+            with self.assertRaisesRegex(
+                NotImplementedError, "not yet supported on SM120"
+            ):
+                flex_gemm_config_keys(
+                    device,
+                    64,
+                    128,
+                    (FlexGemmLocalReduceGeometry(group=2, axis=1),),
+                    tuned=True,
+                    main_transform=FlexGemmGroupedMainOutputTransform(group=2),
+                )
+        with self.assertRaisesRegex(NotImplementedError, "interleaved group 4"):
+            flex_gemm_config_keys(
+                device,
+                64,
+                128,
+                (FlexGemmLocalReduceGeometry(group=4, axis=1),),
+                tuned=True,
+                main_transform=FlexGemmGroupedMainOutputTransform(
+                    group=4, chunked=True
+                ),
+            )
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipIf(not SM100OrLater, "SM100+ required")
+    @unittest.skipIf(SM120OrLater, "grouped-N main outputs are not supported on SM120")
+    def test_mm_grouped_n_main_output_rejects_unsupported_composition(self):
+        m, k, n = 64, 64, 64
+        a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+
+        with self.subTest("group"):
+
+            def group_eight(a, b):
+                def epilogue(acc):
+                    lanes = acc.view(m, n, 8)
+                    return sum(lanes[..., index] for index in range(8))
+
+                return flex_gemm(
+                    torch.mm,
+                    (a, b),
+                    epilogue,
+                    kernel_options={"backend": "QUACK"},
+                )
+
+            b = torch.randn(k, 8 * n, device="cuda", dtype=torch.float16)
+            with self.assertRaisesRegex(InductorError, "group 2.*group 4"):
+                torch.compile(group_eight, backend="inductor", fullgraph=True)(a, b)
+
+        with self.subTest("capture"):
+            torch._dynamo.reset()
+
+            def captured(a, b, scale):
+                def epilogue(acc):
+                    lanes = acc.view(m, n, 2)
+                    return (lanes[..., 0] - lanes[..., 1]) * scale
+
+                return flex_gemm(
+                    torch.mm,
+                    (a, b),
+                    epilogue,
+                    kernel_options={"backend": "QUACK"},
+                )
+
+            b = torch.randn(k, 2 * n, device="cuda", dtype=torch.float16)
+            scale = torch.randn((), device="cuda", dtype=torch.float16)
+            with self.assertRaisesRegex(InductorError, "do not compose"):
+                torch.compile(captured, backend="inductor", fullgraph=True)(a, b, scale)
+
+        with self.subTest("chunked_contiguous_b"):
+            torch._dynamo.reset()
+
+            def chunked(a, b):
+                def epilogue(acc):
+                    gate, up = acc.chunk(2, dim=-1)
+                    return gate - up
+
+                return flex_gemm(
+                    torch.mm,
+                    (a, b),
+                    epilogue,
+                    kernel_options={"backend": "QUACK"},
+                )
+
+            b = torch.randn(k, 2 * n, device="cuda", dtype=torch.float16)
+            with self.assertRaisesRegex(InductorError, "non-contiguous"):
+                torch.compile(chunked, backend="inductor", fullgraph=True)(a, b)
+
+        with self.subTest("dynamic_n"):
+            torch._dynamo.reset()
+
+            def dynamic_n(a, b):
+                def epilogue(acc):
+                    lanes = acc.view(m, -1, 2)
+                    return lanes[..., 0] - lanes[..., 1]
+
+                return flex_gemm(
+                    torch.mm,
+                    (a, b),
+                    epilogue,
+                    kernel_options={"backend": "QUACK"},
+                )
+
+            b = torch.randn(k, 2 * n, device="cuda", dtype=torch.float16)
+            torch._dynamo.mark_dynamic(b, 1)
+            with self.assertRaisesRegex(InductorError, "statically known physical N"):
+                torch.compile(dynamic_n, backend="inductor", fullgraph=True)(a, b)
+
+        with self.subTest("aux"):
+            torch._dynamo.reset()
+
+            def auxiliary(a, b):
+                def epilogue(acc):
+                    lanes = acc.view(m, n, 2)
+                    return lanes[..., 0] - lanes[..., 1], acc
+
+                return flex_gemm(
+                    torch.mm,
+                    (a, b),
+                    epilogue,
+                    kernel_options={"backend": "QUACK"},
+                )
+
+            b = torch.randn(k, 2 * n, device="cuda", dtype=torch.float16)
+            with self.assertRaisesRegex(InductorError, "do not compose"):
+                torch.compile(auxiliary, backend="inductor", fullgraph=True)(a, b)
 
     @skipIfNoCuteDSL
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
@@ -4320,6 +5313,9 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_local_m_reduce_feed_main_rejects_unsupported_group(self, case):
+        # Preserve each case's static geometry instead of inheriting PGO state
+        # from the other parameterization.
+        torch._dynamo.reset()
         _, m, group, error = case
         n = 64
 
@@ -4340,6 +5336,87 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         b = torch.rand(64, n, device="cuda", dtype=torch.bfloat16)
         with self.assertRaisesRegex(Exception, error):
             torch.compile(fn, backend="inductor", fullgraph=True)(a, b)
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipIf(not SM100OrLater, "SM100+ required")
+    def test_mm_local_m_reduce_feed_main_specializes_group_across_functions(self):
+        torch._dynamo.reset()
+        m = 128
+        n = 64
+
+        def make_fn(group):
+            def epilogue_fn(acc, group=group):
+                x = acc.float().view(-1, group, n)
+                scale = x.sum(1, keepdim=True) + 1.0
+                return (x * scale.reciprocal()).view(m, n)
+
+            def fn(a, b):
+                return flex_gemm(
+                    torch.mm,
+                    (a, b),
+                    epilogue_fn,
+                    kernel_options={"backend": "QUACK"},
+                )
+
+            return fn, epilogue_fn
+
+        a = torch.rand(m, 64, device="cuda", dtype=torch.bfloat16)
+        b = torch.rand(64, n, device="cuda", dtype=torch.bfloat16)
+        # These closures deliberately share code objects. Do not reset between
+        # them: the second group exercises automatic-dynamic specialization.
+        for group in (8, 16):
+            fn, epilogue_fn = make_fn(group)
+            actual, (code,) = run_and_get_code(
+                torch.compile(fn, backend="inductor", fullgraph=True), a, b
+            )
+            self.assertMatchesEpilogue(
+                actual,
+                epilogue_fn(a @ b),
+                epilogue_fn(a.double() @ b.double()),
+                a.shape[1],
+            )
+            self.assertPhysicalFeedMainCode(code, group)
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipIf(not SM100OrLater, "SM100+ required")
+    @parametrize("axis", (0, 1))
+    def test_mm_local_reduce_specializes_explicit_group_across_functions(self, axis):
+        torch._dynamo.reset()
+        m = n = 128
+
+        def make_fn(group):
+            def epilogue_fn(acc, group=group):
+                if axis == 1:
+                    x = acc.float().view(m, n // group, group)
+                    scale = x.sum(-1, keepdim=True) + 1.0
+                else:
+                    x = acc.float().view(m // group, group, n)
+                    scale = x.sum(1, keepdim=True) + 1.0
+                return (x * scale.reciprocal()).view(m, n)
+
+            def fn(a, b):
+                return flex_gemm(
+                    torch.mm,
+                    (a, b),
+                    epilogue_fn,
+                    kernel_options={"backend": "QUACK"},
+                )
+
+            return fn, epilogue_fn
+
+        a = torch.rand(m, 64, device="cuda", dtype=torch.bfloat16)
+        b = torch.rand(64, n, device="cuda", dtype=torch.bfloat16)
+        for group in (8, 16):
+            fn, epilogue_fn = make_fn(group)
+            actual = torch.compile(fn, backend="inductor", fullgraph=True)(a, b)
+            self.assertMatchesEpilogue(
+                actual,
+                epilogue_fn(a @ b),
+                epilogue_fn(a.double() @ b.double()),
+                a.shape[1],
+            )
 
     @skipIfNoCuteDSL
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
@@ -5340,6 +6417,7 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             a.shape[1],
         )
         self.assertFlexGemmGeneratedCode(code)
+        self.assertNotIn("output_plan=", code)
 
     @skipIfNoCuteDSL
     @unittest.skipIf(not TEST_CUDA, "CUDA required")

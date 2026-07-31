@@ -126,6 +126,22 @@ LOCAL_REDUCE_OUT_SHAPE_ERROR = "local_reduce_out shape must be {expected}, got {
 LOCAL_REDUCE_CALLBACKS_REQUIRED_ERROR = (
     "physical local reductions require generated local-reduce callbacks"
 )
+FLEX_GEMM_GROUPED_MAIN_COMPOSITION_ERROR = (
+    "FlexGEMM grouped main outputs do not compose with aux outputs, local "
+    "reductions, captured tensors, C, alpha/beta, or batched GEMMs yet"
+)
+FLEX_GEMM_CHUNKED_CONTIGUOUS_B_ERROR = (
+    "FlexGEMM concat-layout grouped-N outputs require B's output dimension to "
+    "be non-contiguous, as in linear weight.t()"
+)
+FLEX_GEMM_GROUPED_MAIN_SHAPE_ERROR = (
+    "unsupported FlexGEMM epilogue: grouped main output shape must equal the "
+    "physical GEMM output shape with N divided by the transform group"
+)
+FLEX_GEMM_MAIN_OUTPUT_SHAPE_ERROR = (
+    "unsupported FlexGEMM epilogue: main output shape must equal the physical "
+    "GEMM output shape"
+)
 
 
 def statically_known_multiple(value: Any, divisor: int) -> bool:
@@ -381,6 +397,66 @@ def flex_gemm_local_reduce_config_error(
     return (
         f"{LOCAL_REDUCE_CONFIG_ERROR}; requested group={group}, "
         f"max supported group={max_group} for axis={axis}"
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class FlexGemmGroupedMainOutputTransform:
+    """Describe contraction of the innermost GEMM output dimension.
+
+    Attributes:
+        group: Number of physical N values contracted into each logical output.
+        chunked: Whether lanes are contiguous N chunks rather than interleaved.
+    """
+
+    group: int
+    chunked: bool = False
+
+    def __post_init__(self) -> None:
+        if self.group <= 0:
+            raise ValueError("grouped main-output group must be positive")
+
+    @property
+    def concat_layout(self) -> tuple[str, ...]:
+        return ("B",) if self.chunked else ()
+
+    def validate_quack(self, device_capacity: int) -> None:
+        if device_capacity == 12:
+            raise NotImplementedError(
+                "FlexGEMM grouped main outputs are not yet supported on SM120"
+            )
+        if device_capacity not in (10, 11):
+            raise NotImplementedError(
+                "FlexGEMM grouped main outputs are currently validated only on "
+                "SM100 and SM110"
+            )
+        if self.group == 2 or (
+            self.group == 4 and not self.chunked and device_capacity == 10
+        ):
+            return
+        raise NotImplementedError(
+            "FlexGEMM grouped main-output stores support group 2 on SM100 and "
+            "SM110, plus interleaved group 4 on SM100"
+        )
+
+
+def grouped_main_output_config_supported(config: Any, n: Any) -> bool:
+    """Return whether a config has validated grouped-N store ownership.
+
+    Keep the physical M/N orientation, one CTA per cluster along N, and require
+    the physical N tile not to exceed the problem. Admit only M-cluster families
+    whose row ownership has been validated: a single M CTA or the wide-M two-CTA
+    layout. Multiple N tiles and partial final tiles are supported by the ordinary
+    tile scheduler and store predicates.
+    """
+    supported_m_cluster = config.cluster_m == 1 or (
+        config.tile_m == 256 and config.cluster_m == 2
+    )
+    return (
+        not config.swap_ab
+        and supported_m_cluster
+        and config.cluster_n == 1
+        and statically_known(config.tile_n <= n)
     )
 
 
