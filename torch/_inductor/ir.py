@@ -184,6 +184,45 @@ log = logging.getLogger(__name__)
 indent = functools.partial(textwrap.indent, prefix="  ")
 aten = torch.ops.aten
 
+
+@dataclasses.dataclass(frozen=True)
+class ExternKernelInputRef:
+    """
+    Reference an entry from ExternKernel.inputs when constructing a custom
+    positional call signature.
+    """
+
+    index: int
+
+    def __post_init__(self) -> None:
+        if self.index < 0:
+            raise ValueError("ExternKernelInputRef index must be non-negative")
+
+
+def extern_kernel_input(index: int) -> ExternKernelInputRef:
+    return ExternKernelInputRef(index)
+
+
+def resolve_extern_kernel_call_args(
+    inputs: Sequence[_T], call_args: Sequence[Any] | None
+) -> tuple[Any, ...]:
+    if call_args is None:
+        return tuple(inputs)
+
+    result: list[Any] = []
+    for arg in call_args:
+        if isinstance(arg, ExternKernelInputRef):
+            if arg.index >= len(inputs):
+                raise IndexError(
+                    f"Extern kernel input reference {arg.index} is out of range "
+                    f"for {len(inputs)} inputs"
+                )
+            result.append(inputs[arg.index])
+        else:
+            result.append(arg)
+    return tuple(result)
+
+
 """ [Note: Inductor IR]
 
 Inductor's IR is produced by executing 'lowering' code (see lowering.py).  Each
@@ -7037,6 +7076,7 @@ class ExternKernel(InputsKernel):
         default_factory=dict
     )
     mutation_outputs: list[MutationOutput] = dataclasses.field(default_factory=list)
+    call_args: Sequence[Any] | None = None
 
     def __init__(
         self,
@@ -7050,6 +7090,7 @@ class ExternKernel(InputsKernel):
         cpp_kernel_name: str | None = None,
         ordered_kwargs_for_cpp_kernel: Iterable[str] = (),
         op_overload: _OpOverloads | None = None,
+        call_args: Sequence[Any] | None = None,
     ) -> None:
         super().__init__(
             name=name,
@@ -7058,6 +7099,7 @@ class ExternKernel(InputsKernel):
         )
         self.constant_args = constant_args
         self.kwargs = kwargs if kwargs else {}
+        self.call_args = call_args
         self.output_view = output_view
         self.op_overload = op_overload
         self.set_cpp_kernel_name(cpp_kernel_name)
@@ -7894,8 +7936,18 @@ class ExternKernel(InputsKernel):
         else:
             return [V.graph.wrapper_code.val_to_arg_str(a) for a in self.constant_args]
 
+    def resolve_call_args(self) -> list[Any]:
+        if self.call_args is None:
+            raise AssertionError("resolve_call_args requires custom call_args")
+        return list(resolve_extern_kernel_call_args(self.inputs, self.call_args))
+
     def codegen_args(self) -> list[str]:
-        if V.graph.cpp_wrapper and self.op_overload is not None:
+        if self.call_args is not None:
+            inputs = self.resolve_call_args()
+            if V.graph.cpp_wrapper and self.op_overload is not None:
+                inputs = list(self.fill_non_provided_args(inputs, self.kwargs))
+            need_codegen_constant_args = False
+        elif V.graph.cpp_wrapper and self.op_overload is not None:
             # cpp wrapper needs special logic to fill in missing args with default values
             inputs = self.fill_non_provided_args(
                 [*self.inputs, *self.constant_args], self.kwargs
@@ -8093,6 +8145,10 @@ class ExternKernel(InputsKernel):
         r = InputsKernel.get_free_symbol_uses(self, unbacked_only)
         for arg in self.constant_args:
             r |= maybe_get_symbols(arg)
+        if self.call_args is not None:
+            for arg in self.call_args:
+                if not isinstance(arg, ExternKernelInputRef):
+                    r |= maybe_get_symbols(arg)
         for arg in self.kwargs.values():
             r |= maybe_get_symbols(arg)
         return r
@@ -8128,6 +8184,7 @@ class ExternKernelOut(ExternKernel):
         cpp_kernel_name: str | None = None,
         ordered_kwargs_for_cpp_kernel: Sequence[Any] = (),
         op_overload: _OpOverloads | None = None,
+        call_args: Sequence[Any] | None = None,
     ) -> None:
         unwrapped_inputs = self.unwrap_storage(inputs)
         if not isinstance(unwrapped_inputs, Sequence):
@@ -8143,6 +8200,7 @@ class ExternKernelOut(ExternKernel):
             cpp_kernel_name,
             ordered_kwargs_for_cpp_kernel,
             op_overload,
+            call_args,
         )
         self.name = V.graph.register_buffer(self)
         V.graph.register_operation(self)
@@ -8185,6 +8243,7 @@ class ExternKernelAlloc(ExternKernel):
         cpp_kernel_name: str | None = None,
         ordered_kwargs_for_cpp_kernel: Sequence[Any] = (),
         op_overload: _OpOverloads | None = None,
+        call_args: Sequence[Any] | None = None,
     ) -> None:
         unwrapped_inputs = self.unwrap_storage(inputs)
         if not all(isinstance(i, IRNode) for i in unwrapped_inputs):
@@ -8202,6 +8261,7 @@ class ExternKernelAlloc(ExternKernel):
             cpp_kernel_name,
             ordered_kwargs_for_cpp_kernel,
             op_overload,
+            call_args,
         )
         # We need output buffers for generating kernel arguments in the
         # abi-compatible mode, where we retrieve outputs by pass each individual
