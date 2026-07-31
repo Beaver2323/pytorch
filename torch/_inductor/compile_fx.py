@@ -115,6 +115,11 @@ from ..fx._lazy_graph_module import _use_lazy_graph_module
 from ..fx.graph import _PyTreeCodeGen
 from ..utils._triton import has_triton
 from . import config, distributed_autotune, metrics
+from .autocast_utils import (
+    force_low_precision_pointwise_barriers,
+    low_precision_autocast_enabled,
+    LOW_PRECISION_FP_DTYPES,
+)
 from .codegen.common import get_wrapper_codegen_for_device, init_backend_registration
 from .debug import DebugContext
 from .decomposition import select_decomp_table
@@ -140,7 +145,7 @@ from .virtualized import V
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Sequence
+    from collections.abc import Callable, Generator, Iterable, Sequence
 
     from torch._inductor.output_code import _StrideExprStr, CompiledFnRunner
     from torch._ops import OpOverload
@@ -3077,6 +3082,42 @@ def _maybe_wrap_and_compile_fx_main(
     )
 
 
+def _is_low_precision_cast_node(node: torch.fx.Node) -> bool:
+    if node.op != "call_function":
+        return False
+
+    if node.target is torch.ops.aten._to_copy.default:
+        dtype = node.kwargs.get("dtype")
+    elif node.target is torch.ops.prims.convert_element_type.default:
+        dtype = node.args[1] if len(node.args) > 1 else None
+    else:
+        return False
+
+    return dtype in LOW_PRECISION_FP_DTYPES
+
+
+def _iter_graph_modules(model: torch.nn.Module) -> Iterable[GraphModule]:
+    for module in model.modules():
+        if isinstance(module, GraphModule):
+            yield module
+
+
+def _has_low_precision_pointwise_barrier(model: torch.nn.Module) -> bool:
+    return any(
+        node.meta.get("low_precision_pointwise_barrier", False)
+        for graph_module in _iter_graph_modules(model)
+        for node in graph_module.graph.nodes
+    )
+
+
+def _has_low_precision_cast(model: torch.nn.Module) -> bool:
+    return any(
+        _is_low_precision_cast_node(node)
+        for graph_module in _iter_graph_modules(model)
+        for node in graph_module.graph.nodes
+    )
+
+
 def _compile_fx_main(
     model_: GraphModule,
     example_inputs_: Sequence[InputType],
@@ -3116,7 +3157,23 @@ def _compile_fx_main(
 
         compiler_config_extra = create_compiler_config_extra(model_)
 
+        # Direct FX inputs are retraced by AOTAutograd outside autocast, so use
+        # explicit low-precision casts as the signal for barrier marking.
+        low_precision_pointwise_barrier = (
+            low_precision_autocast_enabled()
+            or _has_low_precision_cast(model_)
+            or _has_low_precision_pointwise_barrier(model_)
+        )
         decompositions = get_decomp_fn()
+        if low_precision_pointwise_barrier:
+            # Under low-precision autocast, native_layer_norm's reference
+            # decomposition can perturb fp32 statistics enough for later bf16
+            # rounding to diverge from eager. Keep the fast decomposition for
+            # normal graphs, but route autocast/precision-sensitive graphs to
+            # the native fallback.
+            decompositions = decompositions.copy()
+            decompositions.pop(torch.ops.aten.native_layer_norm.default, None)
+            decompositions.pop(torch.ops.aten.native_layer_norm.out, None)
         inner_compile = functools.partial(inner_compile, get_decomp_fn=get_decomp_fn)
 
         def fw_compiler_base(
@@ -3195,9 +3252,16 @@ def _compile_fx_main(
             if isinstance(model_, GraphModule):
                 model_ = run_pre_grad_passes(model_, example_inputs_)
 
-            with functorch_config.patch(
-                unlift_effect_tokens=True,
-                selective_decompose=config.selective_decompose,
+            with (
+                functorch_config.patch(
+                    unlift_effect_tokens=True,
+                    selective_decompose=config.selective_decompose,
+                ),
+                (
+                    force_low_precision_pointwise_barriers()
+                    if low_precision_pointwise_barrier
+                    else contextlib.nullcontext()
+                ),
             ):
                 gm, graph_signature = aot_export_module(
                     model_,
@@ -3266,6 +3330,11 @@ def _compile_fx_main(
             V.set_fake_mode(fake_mode),
             torch._guards.tracing(tracing_context),
             compiled_autograd._disable(),
+            (
+                force_low_precision_pointwise_barriers()
+                if low_precision_pointwise_barrier
+                else contextlib.nullcontext()
+            ),
             functorch_config.patch(
                 unlift_effect_tokens=True,
                 selective_decompose=config.selective_decompose,
