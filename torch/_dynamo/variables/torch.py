@@ -110,6 +110,7 @@ from .torch_function import (
     TorchFunctionModeStackVariable,
 )
 from .user_defined import UserDefinedTupleVariable
+from torch._subclasses.fake_tensor import is_fake_tensor
 
 
 try:
@@ -423,6 +424,7 @@ def _collect_tensors_with_sources(
     Used by handle_autograd_grad to collect tensors from the outputs and inputs
     arguments for grad_fn reachability analysis.
     """
+    from torch._subclasses.fake_tensor import is_fake_tensor
     from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
     from .dicts import ConstDictVariable

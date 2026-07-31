@@ -2509,6 +2509,9 @@ class CondHigherOrderVariable(TorchHigherOrderOperatorVariable):
             # generation.
             if tx.fake_mode is None:
                 raise AssertionError("tx.fake_mode must not be None")
+            # Bump the memo epoch so unbacked SymInts aren't memoized across
+            # subgraphs; both the Python and C++ fake modes participate.
+            # (tx.fake_mode is non-None, checked just above.)
             tx.fake_mode.epoch += 1
 
             if not only_consist_of(ret_val, (TensorVariable, ConstantVariable)):
@@ -2731,6 +2734,9 @@ class SwitchHigherOrderVariable(TorchHigherOrderOperatorVariable):
             # generation.
             if tx.fake_mode is None:
                 raise AssertionError("tx.fake_mode must not be None")
+            # Bump the memo epoch so unbacked SymInts aren't memoized across
+            # subgraphs; both the Python and C++ fake modes participate.
+            # (tx.fake_mode is non-None, checked just above.)
             tx.fake_mode.epoch += 1
 
             if not only_consist_of(

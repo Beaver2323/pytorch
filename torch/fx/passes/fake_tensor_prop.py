@@ -1,7 +1,11 @@
 from typing import Any
 
 import torch.fx
-from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode, is_fake_tensor
+from torch._subclasses.fake_tensor import (
+    FakeTensorMode,
+    is_fake_tensor,
+    FakeTensor
+)
 from torch.fx import Node
 from torch.fx._compatibility import compatibility
 from torch.fx.experimental.proxy_tensor import py_sym_types, snapshot_fake
@@ -34,6 +38,8 @@ class FakeTensorProp(torch.fx.Interpreter):
         if mode is None:
             mode = FakeTensorMode()
         self._mode = mode
+        # Bump the memo epoch so memoization doesn't carry across props (mode is
+        # non-None here); both the Python and C++ fake modes participate.
         mode.epoch += 1
         mode.reset_nt_tensor_id_counter()
         self.seen_subgraphs: OrderedSet[str] = OrderedSet()

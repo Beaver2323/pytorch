@@ -1532,6 +1532,8 @@ def create_functional_call(
                         fake_mode = detect_fake_mode()
                         if fake_mode is None:
                             raise AssertionError("fake_mode must not be None")
+                        # Bump the memo epoch so unbacked SymInts aren't memoized
+                        # across retraces (fake_mode is non-None, checked above).
                         fake_mode.epoch += 1
                         out = PropagateUnbackedSymInts(mod).run(*args)
             else:

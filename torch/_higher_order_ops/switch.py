@@ -24,7 +24,7 @@ from torch._higher_order_ops.utils import (
     validate_subgraph_args_types,
 )
 from torch._ops import HigherOrderOperator
-from torch._subclasses.fake_tensor import FakeTensorMode
+from torch._subclasses.fake_tensor import FakeTensorMode, make_fake_mode
 from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode, track_tensor_tree
 from torch.utils._python_dispatch import _get_current_dispatch_mode
 
@@ -72,7 +72,7 @@ class SwitchOp(HigherOrderOperator):
 
         fake_mode = detect_fake_mode(operands)
         if fake_mode is None or fake_mode.shape_env is None:
-            fake_mode = FakeTensorMode(shape_env=ShapeEnv())
+            fake_mode = make_fake_mode(shape_env=ShapeEnv())
         # pyrefly: ignore [missing-attribute]
         with fake_mode, fake_mode.shape_env.ignore_fresh_unbacked_symbols():
             merged_outputs = [
@@ -368,6 +368,31 @@ def switch_fake_tensor_mode(mode, index, branches, operands):
                     "Unmatched output spec from torch.switch branches: "
                     f"branch0 tree_spec {branch_out_spec[0]} vs branch{i} tree_spec {spec}"
                 )
+
+    merged_outs = []
+    for branches_out in zip(*flat_branch_outs):
+        merged_outs.append(_merge_output(branches_out, mode))
+    return pytree.tree_unflatten(merged_outs, branch_out_spec[0])
+
+
+@switch_op.py_impl(DispatchKey.Fake)
+def switch_cpp_fake_tensor_mode(index, branches, operands):
+    from torch._higher_order_ops.utils import _find_or_create_fake_mode
+
+    mode = _find_or_create_fake_mode()
+    ignore_fresh_unbacked = contextlib.nullcontext()
+    if mode.shape_env:
+        ignore_fresh_unbacked = mode.shape_env.ignore_fresh_unbacked_symbols()
+    with ignore_fresh_unbacked:
+        flat_branch_outs, branch_out_spec = zip(
+            *[pytree.tree_flatten(branch(*operands)) for branch in branches]
+        )
+    for i, spec in enumerate(branch_out_spec):
+        if branch_out_spec[0] != spec:
+            raise RuntimeError(
+                "Unmatched output spec from torch.switch branches: "
+                f"branch0 tree_spec {branch_out_spec[0]} vs branch{i} tree_spec {spec}"
+            )
 
     merged_outs = []
     for branches_out in zip(*flat_branch_outs):

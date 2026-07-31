@@ -1970,6 +1970,18 @@ static Tensor alias_with_sizes_and_strides(
   } else {
     self_tmp_->set_sizes_and_strides(sizes, strides, self.storage_offset());
   }
+  // For a C++ fake tensor, the fresh impl copied self's key set (carrying the
+  // Fake key) but not the fake device/mode, which live in ExtraMeta and the
+  // custom-device flag rather than the key set. Re-establish that coupling so
+  // the alias is a well-formed fake instead of an is_fake() tensor stuck on the
+  // meta device.
+  if (self.is_fake()) {
+    auto* src = self.unsafeGetTensorImpl();
+    if (auto fake_device = src->fake_device()) {
+      self_tmp_->set_and_normalize_fake_device(*fake_device);
+    }
+    self_tmp_->set_fake_tensor_mode(src->fake_tensor_mode());
+  }
   return self_;
 }
 

@@ -934,7 +934,10 @@ inline DispatchKey legacyExtractDispatchKey(DispatchKeySet s) {
                DispatchKey::FuncTorchGradWrapper,
                DispatchKey::FuncTorchVmapMode,
                DispatchKey::FuncTorchBatched,
-               DispatchKey::Python}))
+               DispatchKey::Python,
+               // Fake is stored on top of the backend key (CPU/CUDA) for C++
+               // fake tensors; treat it as an overlay so the backend shows through.
+               DispatchKey::Fake}))
       .highestPriorityTypeId();
 }
 

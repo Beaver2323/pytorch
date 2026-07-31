@@ -71,11 +71,14 @@ from torch._library.opaque_object import (
 )
 from torch._ops import HigherOrderOperator, OpOverload, OpOverloadPacket
 from torch._subclasses.fake_tensor import (
+    maybe_get_fake_mode,
+    is_fake_tensor,
     FakeTensor,
     FakeTensorMode,
     is_fake,
     is_fake_tensor,
     maybe_get_fake_mode,
+    is_fake_tensor,
 )
 from torch._subclasses.meta_utils import is_sparse_any, safe_grad
 from torch._utils_internal import justknobs_check
@@ -2859,7 +2862,7 @@ class VariableBuilder:
         return LazyConstantVariable.create(value, source=self.source)
 
     def assert_not_wrapped_by_this_graph(self, value: torch.Tensor) -> None:
-        if is_fake(value) and maybe_get_fake_mode(value) is self.tx.fake_mode:
+        if maybe_get_fake_mode(value) is self.tx.fake_mode:
             raise InternalTorchDynamoError(
                 "Cannot wrap a Tensor that has already been",
                 "wrapped by this instance of Dynamo",
@@ -3507,7 +3510,10 @@ class VariableBuilder:
 
         fake_tensor_value = example_value
         # type: ignore[attr-defined]
-        if fake_tensor_value.fake_mode is not self.tx.fake_mode:
+        if (
+            is_fake_tensor(fake_tensor_value)
+            and maybe_get_fake_mode(fake_tensor_value) is not self.tx.fake_mode
+        ):
             raise AssertionError(
                 f"fake mode ({fake_tensor_value.fake_mode}) from fake tensor metadata doesn't match mode"
                 "({self.tx.fake_mode}) from InstructionTranslator"
@@ -3594,6 +3600,7 @@ class VariableBuilder:
             else:
                 # type: ignore[attr-defined]
                 example_value = unspec_var.proxy.node.meta["example_value"]
+
             if not is_fake(example_value):
                 raise AssertionError(
                     f"Expected fake tensor example_value, got {type(example_value)}"
@@ -3601,7 +3608,10 @@ class VariableBuilder:
 
             fake_tensor_value = example_value
             # type: ignore[attr-defined]
-            if fake_tensor_value.fake_mode is not self.tx.fake_mode:
+            if (
+                is_fake_tensor(fake_tensor_value)
+                and maybe_get_fake_mode(fake_tensor_value) is not self.tx.fake_mode
+            ):
                 raise AssertionError(
                     f"fake mode ({fake_tensor_value.fake_mode}) from fake tensor metadata doesn't match mode"
                     "({self.tx.fake_mode}) from InstructionTranslator"
@@ -3656,8 +3666,12 @@ def _clone_input(value: Any, fake_mode: FakeTensorMode | None) -> Any:
             )
             or value.is_nested
         ):
-            # NB: ensure strides are preserved
-            value = clone_input(value)
+            # NB: ensure strides are preserved.
+            # we need to manually disable C++ faketensormode here
+            from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+            with unset_fake_temporarily():
+                value = clone_input(value)
 
     return value
 
@@ -3847,8 +3861,9 @@ def _wrap_fx_preexisting_tensor(
             # pyrefly: ignore [missing-argument]
             tensor = wrap_to_fake_tensor_and_record(tensor, tx=tx, **kwargs)
 
-        if tensor.device.type != "meta" and (
-            maybe_get_fake_mode(tensor) is not tx.fake_mode
+        if (
+            tensor.device.type != "meta"
+            and maybe_get_fake_mode(tensor) is not tx.fake_mode
         ):
             raise InternalTorchDynamoError(
                 "`tensor` needs to be a `FakeTensor`"

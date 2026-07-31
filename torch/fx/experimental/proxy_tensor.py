@@ -58,9 +58,12 @@ from torch._subclasses.fake_tensor import (
     get_plain_tensors,
     is_fake,
     is_fake_tensor,
+    make_fake_mode,
     maybe_get_fake_mode,
     unset_fake_temporarily,
 )
+
+
 from torch._subclasses.functional_tensor import FunctionalTensor
 from torch._subclasses.meta_utils import is_sparse_any
 from torch.fx import GraphModule, Proxy, Tracer
@@ -700,6 +703,7 @@ def snapshot_fake(val: Tensor, include_real: bool = False) -> Tensor | None:
     if is_fake_tensor(val):
         return fast_detach(maybe_get_fake_mode(val), val, include_real)
     else:
+        # C++ fake tensors are plain Tensors — detach is sufficient
         return val.detach()
 
 
@@ -736,6 +740,13 @@ def extract_val(val: _ExtractValType, include_real: bool = False) -> _ExtractVal
         return {k: extract_val(v) for k, v in val.items()}
     elif isinstance(val, Tensor):
         if not val.is_sparse:
+            if torch._C._dispatch_tls_is_dispatch_key_included(
+                torch._C.DispatchKey.Fake
+            ):
+                return torch.empty_strided(  # revist this
+                    val.shape, val.stride(), device=val.device, dtype=val.dtype
+                )
+
             # NB: Kinda hacky, but we should try to get val as the metadata
             # everywhere
             # TODO: This doesn't properly track storages.  A more robust
@@ -746,7 +757,7 @@ def extract_val(val: _ExtractValType, include_real: bool = False) -> _ExtractVal
 
             fake_tensor_mode = detect_fake_mode(val)
             if not fake_tensor_mode:
-                fake_tensor_mode = FakeTensorMode(allow_fallback_kernels=True)
+                fake_tensor_mode = make_fake_mode(allow_fallback_kernels=True)
             with fake_tensor_mode:
                 return torch.empty_strided(
                     val.shape, val.stride(), device=val.device, dtype=val.dtype
@@ -2904,6 +2915,8 @@ class _MakefxTracer:
             # Avoid importing sympy at a module level
             from .symbolic_shapes import ShapeEnv
 
+            import torch._dynamo
+
             if hasattr(f, "_orig_mod") and self.record_module_stack:
                 scope_root = f._orig_mod
                 # _ModuleStackTracer always try to preserve stack trace
@@ -2918,17 +2931,18 @@ class _MakefxTracer:
                     self.fx_tracer._record_forward_stack_traces_only = True
 
             if self.tracing_mode == "fake":
-                import torch._dynamo
-
                 fake_tensor_mode = torch._dynamo.utils.detect_fake_mode(args)
                 if fake_tensor_mode is None:
                     import torch._functorch.config as _config
 
+                    # A ShapeEnv is still needed so data-dependent ops (e.g.
+                    # .item()) can allocate unbacked symbols; static_shapes keeps
+                    # input sizes concrete.
                     with _config.patch(fake_tensor_allow_unsafe_data_ptr_access=False):
-                        fake_tensor_mode = FakeTensorMode(
-                            allow_fallback_kernels=True,
-                            allow_non_fake_inputs=self._allow_non_fake_inputs,
+                        fake_tensor_mode = make_fake_mode(
                             shape_env=ShapeEnv(),
+                            allow_non_fake_inputs=self._allow_non_fake_inputs,
+                            allow_fallback_kernels=True,
                             static_shapes=True,
                         )
                 # dynamic_shapes wires unbacked symbols into the shape env, so
@@ -2946,18 +2960,17 @@ class _MakefxTracer:
                     )
                 self.fake_tensor_mode = fake_tensor_mode
             elif self.tracing_mode == "symbolic":
-                import torch._dynamo
-
                 fake_tensor_mode = torch._dynamo.utils.detect_fake_mode(args)
                 if fake_tensor_mode is None:
                     shape_env = ShapeEnv()
                     import torch._functorch.config as _config
 
                     with _config.patch(fake_tensor_allow_unsafe_data_ptr_access=False):
-                        fake_tensor_mode = FakeTensorMode(
-                            allow_fallback_kernels=False,
-                            allow_non_fake_inputs=self._allow_non_fake_inputs,
+                        fake_tensor_mode = make_fake_mode(
                             shape_env=shape_env,
+                            allow_non_fake_inputs=self._allow_non_fake_inputs,
+                            allow_fallback_kernels=False,
+                            static_shapes=False,
                         )
                 if fake_tensor_mode.shape_env is None:
                     raise AssertionError(
@@ -3470,6 +3483,11 @@ def _set_unbacked_bindings(out: object, out_proxy: _NestedProxys) -> None:
         "FakeTensorMode | None",
         torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.FAKE),
     )
+    if fake_mode is None:
+        # The cpp mode currently dispatching (detect_fake_mode is intentionally
+        # avoided here, see above; `out` may be a bare SymInt that carries no
+        # mode, so recover from the active scope rather than the output).
+        fake_mode = torch._C._current_cpp_fake_tensor_mode()
     if fake_mode and fake_mode.shape_env:
         if symbol_to_path := compute_unbacked_bindings(fake_mode.shape_env, out):
             # `symbol_to_path` is keyed by the fresh unbacked symbol; each path

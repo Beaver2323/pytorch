@@ -44,7 +44,11 @@ constexpr auto kTensorSubclassLike =
          DispatchKey::Batched,
          DispatchKey::Sparse,
          DispatchKey::SparseCsr,
-         DispatchKey::Python}) |
+         DispatchKey::Python,
+         // C++ FakeTensors carry the Fake key instead of the Python key that
+         // Python FakeTensors carry; treat them as subclass-like too so ops
+         // pick data-independent paths (e.g. avoid masked_select).
+         DispatchKey::Fake}) |
     DispatchKeySet(BackendComponent::MetaBit);
 
 inline bool isTensorSubclassLike(const Tensor& tensor) {

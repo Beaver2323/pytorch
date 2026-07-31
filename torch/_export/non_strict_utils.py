@@ -615,15 +615,22 @@ def make_fake_inputs(
             "co_firstlineno": code.co_firstlineno,
         }
         with _config.patch(fake_tensor_allow_unsafe_data_ptr_access=False):
-            fake_mode = FakeTensorMode(
-                shape_env=ShapeEnv(
-                    tracked_fakes=[],
-                    co_fields=co_fields,
-                    prefer_deferred_runtime_asserts_over_guards=prefer_deferred_runtime_asserts_over_guards,
-                    trace_asserts=True,
-                ),
+            export_shape_env = ShapeEnv(
+                tracked_fakes=[],
+                co_fields=co_fields,
+                prefer_deferred_runtime_asserts_over_guards=prefer_deferred_runtime_asserts_over_guards,
+                trace_asserts=True,
+            )
+            from torch._subclasses.fake_tensor import (
+                FakeTensorConverter,
+                make_fake_mode,
+            )
+
+            fake_mode = make_fake_mode(
+                shape_env=export_shape_env,
                 allow_non_fake_inputs=True,
                 export=True,
+                converter=FakeTensorConverter(export=True),
             )
     if fake_mode.shape_env is None or fake_mode.shape_env.tracked_fakes is None:
         raise ValueError(

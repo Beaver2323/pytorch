@@ -70,7 +70,12 @@ from torch._guards import (
 )
 from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import is_custom_class
-from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.fake_tensor import (
+    CppFakeTensorMode,
+    FakeTensor,
+    is_fake_tensor,
+    make_fake_mode,
+)
 from torch._utils_internal import signpost_event
 from torch.export.dynamic_shapes import _ConstraintTarget
 from torch.fx._lazy_graph_module import _make_graph_module  # type: ignore[attr-defined]
@@ -856,8 +861,9 @@ class OutputGraph(OutputGraphCommon):
         # of the user marked dynamic dims
         import torch._functorch.config as _config
 
+        fake_mode: torch._subclasses.FakeTensorMode | CppFakeTensorMode
         with _config.patch(fake_tensor_allow_unsafe_data_ptr_access=False):
-            fake_mode = torch._subclasses.FakeTensorMode(
+            fake_mode = make_fake_mode(
                 shape_env=shape_env,
                 # TODO (tmanlaibaatar) Remove this once we always lift params and buffers
                 allow_non_fake_inputs=bool(self.export),
@@ -868,6 +874,7 @@ class OutputGraph(OutputGraphCommon):
         self.tracing_context.cudagraph_annotation = self.cudagraph_annotation
         self.traced_code = self.tracing_context.traced_code
         self.dynamo_compile_id: CompileId | None = CompileContext.current_compile_id()
+
         self.init_ambient_guards()
 
         # Wire ShapesSpec.assumptions BEFORE any input is processed. Each
@@ -1502,7 +1509,7 @@ class OutputGraph(OutputGraphCommon):
         return self
 
     @property
-    def fake_mode(self) -> torch._subclasses.FakeTensorMode:
+    def fake_mode(self) -> torch._subclasses.FakeTensorMode | CppFakeTensorMode:
         if self.tracing_context.fake_mode is None:
             raise AssertionError("tracing_context.fake_mode must not be None")
         return self.tracing_context.fake_mode
@@ -3021,7 +3028,7 @@ class OutputGraph(OutputGraphCommon):
                     # from scratch when we go to AOTAutograd. But the ShapeEnv must be preserved as
                     # Dynamo made decisions about what is dynamic or not / guards from the user code
                     # that is not in graph.
-                    backend_fake_mode = torch._subclasses.FakeTensorMode(
+                    backend_fake_mode = make_fake_mode(
                         shape_env=old_fake_mode.shape_env,
                     )
                 # TODO(voz): Ostensibly, this should be scoped and
@@ -4276,11 +4283,14 @@ class SubgraphTracer(fx.Tracer):
     ) -> fx.Proxy:
         if isinstance(example_value, torch.Tensor):
             self._input_versions_at_beginning.append(example_value._version)
+            ev_str = f"{example_value.__class__.__name__}(..., size={tuple(example_value.shape)})"
+        else:
+            ev_str = example_value
         log.debug(
             "create_graph_input %s %s %s at debug_level %s before=%s",
             name,
             source.name if source is not None else "(none)",
-            example_value,
+            ev_str,
             self.debug_level,
             before,
         )

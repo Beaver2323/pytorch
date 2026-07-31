@@ -214,7 +214,13 @@ def run_functionalized_fw_and_collect_metadata(
         fake_mode = detect_fake_mode()
         if fake_mode and (shape_env := fake_mode.shape_env):
             suppress_pending = shape_env.ignore_fresh_unbacked_symbols()
-        with disable_above, mode, suppress_pending, disable_autocast_cache():
+
+        with (
+            disable_above,
+            mode,
+            suppress_pending,
+            disable_autocast_cache(),
+        ):
             # precondition: The passed in function already handles unflattening inputs + flattening outputs
             flat_f_args = pytree.tree_map(_to_fun, flat_args)
             flat_f_args_descs = flat_args_descs
@@ -236,8 +242,8 @@ def run_functionalized_fw_and_collect_metadata(
 
             # We didn't do any tracing, so we don't need to process the
             # unbacked symbols, they will just disappear into the ether.
-            # Also, prevent memoization from applying.
-            if fake_mode:
+            # Also, prevent memoization from applying (both fake modes).
+            if fake_mode is not None:
                 fake_mode.epoch += 1
                 fake_mode.reset_nt_tensor_id_counter()
 

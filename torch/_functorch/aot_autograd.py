@@ -29,7 +29,7 @@ from torch._guards import detect_fake_mode
 from torch._inductor.codecache import resolve_pre_grad_pass_timing
 
 # Runtime annotation consumers still resolve BoxedBool from module globals.
-from torch._subclasses import FakeTensorMode
+from torch._subclasses import FakeTensorMode, make_fake_mode
 from torch._subclasses.fake_tensor import maybe_get_fake_mode
 from torch.export._tree_utils import reorder_kwargs
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -812,6 +812,14 @@ def aot_function(
                 PlainAOTInput(i) for i in range(len(fake_flat_args))
             ]
             with contextlib.ExitStack() as stack:
+                fake_flat_args, act_input_indices = process_inputs(
+                    flat_args, aot_config, fake_mode, shape_env
+                )
+                # TODO: We actually could use the pytree path to make better descs.
+                # Also, the descs here are bad if you do aot_module.
+                fake_flat_args_descs: list[AOTInput] = [
+                    PlainAOTInput(i) for i in range(len(fake_flat_args))
+                ]
                 aot_state = create_aot_state(
                     stack,
                     flat_fn,
@@ -1001,6 +1009,10 @@ def prepare_aot_config(
         fake_mode = maybe_get_fake_mode(x)
         if fake_mode is not None:
             dynamic_shapes = fake_mode.shape_env is not None
+            break
+        if isinstance(x, torch.Tensor) and torch._C._is_fake_tensor(x):
+            if tracing_context := torch._guards.TracingContext.try_get():
+                dynamic_shapes = tracing_context.fake_mode.shape_env is not None
             break
 
     aot_config = AOTConfig(
@@ -1859,7 +1871,7 @@ def aot_export_joint_simple(
         # Attempt to run the fw_module with the original user inputs
         fake_mode = detect_fake_mode(args)
         if fake_mode is None:
-            fake_mode = FakeTensorMode()
+            fake_mode = make_fake_mode()
         with fake_mode:
             fw_module(*args)
     return fx_g

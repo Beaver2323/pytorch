@@ -91,6 +91,7 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir
 from torch._inductor.utils import (
     BoxedBool,
     count_tangents,
+    create_fake_mode,
     fresh_cache,
     get_all_devices,
     get_static_bw_input_idxs,
@@ -102,6 +103,7 @@ from torch._inductor.utils import (
 )
 from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import is_custom_class
+from torch._subclasses.fake_tensor import make_fake_mode
 from torch._logging import trace_structured
 from torch._utils_internal import compile_time_strobelight_meta
 from torch.fx import GraphModule
@@ -735,7 +737,7 @@ def fake_tensor_prop(
     with enable_python_dispatcher():
         fake_mode = detect_fake_mode(example_inputs)
         if not fake_mode:
-            fake_mode = torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True)
+            fake_mode = create_fake_mode(allow_non_fake_inputs=True)
             FakeTensorProp(gm, mode=fake_mode).propagate(*example_inputs)
         else:
             ctx = (
@@ -3111,9 +3113,7 @@ def _compile_fx_main(
 
         bw_compiler = SerializableAOTDispatchCompiler(OutputCode, bw_compiler)
 
-        fake_mode = detect_fake_mode(
-            example_inputs_
-        ) or torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True)
+        fake_mode = detect_fake_mode(example_inputs_) or make_fake_mode(allow_non_fake_inputs=True)
         tracing_context = (
             torch._guards.TracingContext.try_get()
             or torch._guards.TracingContext(fake_mode)
@@ -3446,9 +3446,7 @@ def autograd_cache_key(
     #       torch._guards.tracing, compiled_autograd._disable,
     #       functorch_config.patch
 
-    fake_mode = detect_fake_mode(example_inputs) or torch._subclasses.FakeTensorMode(
-        allow_non_fake_inputs=True
-    )
+    fake_mode = detect_fake_mode(example_inputs) or make_fake_mode(allow_non_fake_inputs=True)
     tracing_context = (
         torch._guards.TracingContext.try_get()
         or torch._guards.TracingContext(fake_mode)
