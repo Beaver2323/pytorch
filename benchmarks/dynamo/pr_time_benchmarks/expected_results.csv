@@ -134,7 +134,6 @@ autograd_function_apply_13_in_2_out_no_save,instruction_count,31627,0.1
 
 
 
-
 runtime_overhead_eager_cpu,instruction_count,158800,0.1
 
 
@@ -172,3 +171,11 @@ runtime_overhead_inductor_requires_grad_backward,instruction_count,124900,0.1
 
 
 runtime_overhead_inductor_requires_grad_backward_dynamic,instruction_count,125400,0.1
+
+
+
+disable_overhead,instruction_count,3369,0.1
+
+
+
+disable_dynamo_overhead,instruction_count,5291,0.1
