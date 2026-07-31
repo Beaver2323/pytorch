@@ -6227,6 +6227,7 @@ class ChoiceCaller:
         self.failed: bool = False
         # When True, benchmark using CUDA graph capture/replay
         self._benchmark_with_cudagraphs: bool = False
+        self.tunable_dyn_dims_mask: tuple[bool, bool, bool, bool] | None = None
         # A place to store annotations that can be read post benchmarking
         # Use this to shuttle information between ChoieCaller generation
         # and the end of benchmarking

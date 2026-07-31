@@ -2664,6 +2664,9 @@ def use_cpp_gemm_template(
     if has_free_symbols((n, k)):
         return False
 
+    if mat1.get_dtype() == torch.half and n == 1:
+        return False
+
     if isinstance(mat2, ir.BaseView):
         mat2 = mat2.unwrap_view()
 

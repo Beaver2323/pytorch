@@ -1936,6 +1936,79 @@ PyObject* THCPModule_cuda_tunableop_get_cublaslt_requested_algo_count(
   END_HANDLE_TH_ERRORS
 }
 
+namespace {
+
+constexpr const char* kTunableDynamicDimsGuardCapsuleName =
+    "at::cuda::tunable::TunableDynamicDimsGuard";
+
+void THCPModule_cuda_tunableop_dynamic_dims_mask_capsule_destructor(
+    PyObject* capsule) {
+  if (!PyCapsule_IsValid(capsule, kTunableDynamicDimsGuardCapsuleName)) {
+    return;
+  }
+  auto* guard = static_cast<at::cuda::tunable::TunableDynamicDimsGuard*>(
+      PyCapsule_GetPointer(capsule, kTunableDynamicDimsGuardCapsuleName));
+  delete guard;
+}
+
+} // namespace
+
+PyObject* THCPModule_cuda_tunableop_push_dynamic_dims_mask(
+    PyObject* _unused,
+    PyObject* arg) {
+  HANDLE_TH_ERRORS
+  TORCH_CHECK(
+      THPUtils_checkLong(arg),
+      "cuda_tunableop_push_dynamic_dims_mask expects an int, but got ",
+      THPUtils_typename(arg));
+  // Pack the four dim flags (M/N/K/BATCH) into the low 4 bits on the Python
+  // side, push as a single mask value here. See torch.cuda.tunable
+  // .dynamic_dims_mask context manager for the high-level wrapper.
+  auto bits = static_cast<uint8_t>(THPUtils_unpackLong(arg));
+  at::cuda::tunable::TunableDynamicDimsGuard* guard =
+      new at::cuda::tunable::TunableDynamicDimsGuard(
+          at::cuda::tunable::DynamicDimsMask{bits});
+  // Returning the heap-owned guard pointer as a PyCapsule so the Python side
+  // owns its lifetime; pop_dynamic_dims_mask takes the same capsule and
+  // deletes it, which runs the dtor and pops the TLS stack.
+  PyObject* capsule = PyCapsule_New(
+      static_cast<void*>(guard),
+      kTunableDynamicDimsGuardCapsuleName,
+      THCPModule_cuda_tunableop_dynamic_dims_mask_capsule_destructor);
+  if (capsule == nullptr) {
+    delete guard;
+    if (!PyErr_Occurred()) {
+      PyErr_SetString(
+          PyExc_RuntimeError,
+          "Failed to create TunableDynamicDimsGuard capsule.");
+    }
+  }
+  return capsule;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject* THCPModule_cuda_tunableop_pop_dynamic_dims_mask(
+    PyObject* _unused,
+    PyObject* arg) {
+  HANDLE_TH_ERRORS
+  TORCH_CHECK(
+      PyCapsule_IsValid(arg, kTunableDynamicDimsGuardCapsuleName),
+      "cuda_tunableop_pop_dynamic_dims_mask expects a valid, unconsumed "
+      "TunableDynamicDimsGuard capsule");
+  auto* guard = static_cast<at::cuda::tunable::TunableDynamicDimsGuard*>(
+      PyCapsule_GetPointer(arg, kTunableDynamicDimsGuardCapsuleName));
+  delete guard;
+  PyCapsule_SetDestructor(arg, nullptr);
+  // Mark the capsule as consumed by renaming it. PyCapsule_SetPointer
+  // rejects nullptr (it raises a ValueError), so we instead change the
+  // capsule's name to a sentinel that subsequent PyCapsule_GetPointer
+  // calls will not match -- giving us double-pop detection without
+  // tripping the CPython null-pointer guard.
+  PyCapsule_SetName(arg, "at::cuda::tunable::TunableDynamicDimsGuard[popped]");
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
 PyObject* THCPModule_cuda_tunableop_set_filename(
     PyObject* _unused,
     PyObject* args) {
@@ -2447,6 +2520,14 @@ static struct PyMethodDef _THCPModule_methods[] = {
     {"_cuda_tunableop_set_filename",
      THCPModule_cuda_tunableop_set_filename,
      METH_VARARGS,
+     nullptr},
+    {"_cuda_tunableop_push_dynamic_dims_mask",
+     THCPModule_cuda_tunableop_push_dynamic_dims_mask,
+     METH_O,
+     nullptr},
+    {"_cuda_tunableop_pop_dynamic_dims_mask",
+     THCPModule_cuda_tunableop_pop_dynamic_dims_mask,
+     METH_O,
      nullptr},
     {"_cuda_tunableop_get_filename",
      THCPModule_cuda_tunableop_get_filename,

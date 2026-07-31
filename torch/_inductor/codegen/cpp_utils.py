@@ -540,6 +540,7 @@ def get_gemm_template_output_and_compute_dtype(input_dtype):
 
 
 def create_epilogue_with_attr(input_buffer, attr, **kwargs):
+    """Create a pointwise epilogue for the requested template attribute."""
     input_loader = input_buffer.make_loader()
     dtype = input_buffer.get_dtype()
     if attr == "relu":
@@ -696,10 +697,18 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
         beta = kwargs["beta"]
         other = kwargs["other"]
         dtype = kwargs["dtype"]
+        num_input_dims = len(input_buffer.get_size())
+        num_other_dims = len(other.get_size())
+        dims_diff = num_input_dims - num_other_dims
+        if dims_diff < 0:
+            raise AssertionError(
+                f"Expected input_buffer dims ({num_input_dims}) >= "
+                f"other dims ({num_other_dims})"
+            )
         bias_loader = other.make_loader()
 
         def inner_fn(index):
-            bias = bias_loader(index)
+            bias = bias_loader(index[dims_diff:] if dims_diff != 0 else index)
             input = input_loader(index)
             if beta != 1:
                 result = ops.constant(beta, torch.float) * bias + input
