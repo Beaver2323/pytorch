@@ -35,6 +35,8 @@ class _FakeDebugHandler:
 
 
 class TestDebugGraphDump(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def test_legacy_svg_flags_default_to_svg_with_global_dot_format(self) -> None:
         with mock.patch.dict(
             os.environ,

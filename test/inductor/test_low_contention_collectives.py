@@ -14,6 +14,8 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 @unittest.skipIf(not dist.is_available(), "requires distributed")
 class TestLowContentionCollectives(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def _build_ag_graph(self):
         """Build an FX graph: input -> all_gather -> wait_tensor -> output (no compute)."""
         c10d_fn = torch.ops._c10d_functional
