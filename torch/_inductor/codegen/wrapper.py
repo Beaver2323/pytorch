@@ -2165,6 +2165,27 @@ class PythonWrapperCodegen(CodeGen):
         self.writeline(ExitCudaMemPoolContextLine())
 
     def generate_return(self, output_refs: list[str]) -> None:
+        # A repeated bare name in output_refs would return the same tensor
+        # object multiple times, while eager mode returns distinct tensors
+        # that alias the same storage. The difference is observable by user
+        # code running after a graph break: resize_() on one output also
+        # resizes the others and corrupts results (see #191449). Duplicated
+        # expression refs (e.g. reinterpret_tensor(...)) already evaluate to
+        # distinct objects, so only bare names need wrapping.
+        seen_refs: OrderedSet[str] = OrderedSet()
+        deduped_refs: list[str] = []
+        for ref in output_refs:
+            is_repeated_name = (
+                ref in seen_refs
+                and ref.isidentifier()
+                and ref not in ("None", "True", "False")
+            )
+            if is_repeated_name:
+                deduped_refs.append(f"{ref}.view_as({ref})")
+            else:
+                seen_refs.add(ref)
+                deduped_refs.append(ref)
+        output_refs = deduped_refs
         if output_refs:
             if config.nan_asserts:
                 self.wrapper_call.writeline(

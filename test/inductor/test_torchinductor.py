@@ -19354,6 +19354,21 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         for _ in range(4):
             self.assertEqual(compiled(x, a, b), fn(x, a, b))
 
+    def test_resize_on_view_after_graph_break(self):
+        # https://github.com/pytorch/pytorch/issues/191449
+        # resize_() graph-breaks, so base and alias escape the compiled
+        # graph into eager code; they must be distinct tensor objects as
+        # in eager mode, or the resize_ corrupts base as well.
+        def fn(x):
+            base = x + 1
+            alias = base.view(-1)
+            alias.resize_(12)
+            return base + 1
+
+        expected = fn(torch.zeros(1, device=self.device))
+        actual = torch.compile(fn)(torch.zeros(1, device=self.device))
+        self.assertEqual(expected, actual)
+
     # end of class CommonTemplate - add new tests here
 
 
