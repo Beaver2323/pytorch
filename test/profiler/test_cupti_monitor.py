@@ -884,6 +884,53 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(args["func"], "AllReduce")
         self.assertEqual(args["count"], 4096)
 
+    def test_graph_host_node_rendered_in_trace(self):
+        # A CUPTI GRAPH_HOST_NODE record (a CPU callback run as a CUDA-graph node) renders as a
+        # "HostNode" span under cat "graph_host_node" on the waiting stream's lane, with its
+        # graph id / node id and dict annotation patched on like the other graphed ops. When a
+        # host_fn name/address is resolved (recorded at graph instantiate), the span is named
+        # "HostNode: <fn>" and both surface in args. Drives the columnar merge directly (no CUDA).
+        import numpy as np
+
+        from torch.profiler._cupti.monitor_trace import _trace_window_entries
+
+        def col(v):
+            return np.array([v], dtype=np.int64)
+
+        columns = {
+            "graph_host_node": {
+                "start_ns": col(1000),
+                "end_ns": col(2000),
+                "device_id": col(0),
+                "context_id": col(1),
+                "stream_id": col(7),
+                "correlation_id": col(9),
+                "graph_id": col(1),
+                # graph id packed into the upper 32 bits; only the lower node id is surfaced
+                "graph_node_id": col((1 << 32) | 202),
+                "annotation": np.array([{"ann_id": "host"}], dtype=object),
+                "process_id": col(4321),
+                "thread_id": col(8765),
+                "host_fn": np.array(["free"], dtype=object),
+                "host_fn_addr": col(0x7FABCD),
+            }
+        }
+        _, events = _trace_window_entries({"columns": columns}, base_ns=0)
+        host = [e for e in events if e.get("cat") == "graph_host_node"]
+        self.assertEqual(len(host), 1)
+        ev = host[0]
+        self.assertEqual(ev["name"], "HostNode: free")
+        self.assertEqual(ev["pid"], 0)  # rendered on the device lane
+        args = ev["args"]
+        self.assertEqual(args["stream"], 7)
+        self.assertEqual(args["host process"], 4321)
+        self.assertEqual(args["host thread"], 8765)
+        self.assertEqual(args["graph id"], 1)
+        self.assertEqual(args["graph node id"], 202)
+        self.assertEqual(args["ann_id"], "host")  # dict annotation spread into args
+        self.assertEqual(args["host fn"], "free")
+        self.assertEqual(args["host fn addr"], hex(0x7FABCD))
+
     def test_graph_kernel_reassigned_to_logical_lane(self):
         # A graphed kernel the lane resolver maps to a logical lane is placed on that lane
         # (tid + args["stream"]), its real CUDA stream is preserved as original_stream, the
@@ -1058,6 +1105,34 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(
             (s["ts"], f["ts"]), (4.4, 3.5)
         )  # end -> start, backwards under skew
+
+    def test_graph_dependency_flows_host_node_zero_correlation(self):
+        # A CUDA-graph host node carries correlationId 0 on every replay after the first (a CUPTI
+        # limitation); without re-bucketing, those replays collapse together and their dependency
+        # arrows drop. Each corr-0 row is reassigned to the replay whose time window contains it,
+        # so a device-op -> host-node edge draws an arrow on every replay, not just the first.
+        from torch.profiler._cupti.monitor_trace import _graph_dependency_flow_events
+
+        # node 22 (device op, lane 8) -> node 21 (host node, lane 7) per replay. Host node keeps
+        # its correlationId only on replay 1 (100); replays 2/3 report 0 but fall inside the
+        # correlated device op's window (201: [3000,4000], 202: [5000,6000]).
+        node_rows = [
+            (100, 22, 0, 8, 1000, 2000),
+            (100, 21, 0, 7, 2000, 2100),
+            (201, 22, 0, 8, 3000, 4000),
+            (0, 21, 0, 7, 4000, 4100),
+            (202, 22, 0, 8, 5000, 6000),
+            (0, 21, 0, 7, 6000, 6100),
+        ]
+        events = _graph_dependency_flow_events(node_rows, {21: [22]}, base_ns=0)
+        starts = [e for e in events if e["ph"] == "s"]
+        fins = [e for e in events if e["ph"] == "f"]
+        self.assertEqual(len(starts), 3)  # one edge per replay, incl. the corr-0 ones
+        self.assertEqual(len(fins), 3)
+        # every arrow lands on the host node's lane (7) at its start, from the device op's end (8)
+        self.assertEqual({f["tid"] for f in fins}, {7})
+        self.assertEqual({f["ts"] for f in fins}, {2.0, 4.0, 6.0})
+        self.assertEqual({s["tid"] for s in starts}, {8})
 
     def test_cpu_launch_flow_targets_only_graph_roots(self):
         # With graph node->node arrows drawn (graph_deps present), the CPU-launch -> GPU-op flow
@@ -2072,6 +2147,82 @@ _cupti_monitor.enable_hes_early()
         self.assertGreater(stats["buffers_completed"], 0)
         self.assertEqual(stats["buffers_pending"], 0)
         self.assertGreater(len(start), 0)
+
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @_isolated
+    def test_graph_host_node_collected_on_device(self):
+        # End-to-end: a CUDA-graph host node (a CPU callback run as a graph node) is collected
+        # as a GRAPH_HOST_NODE record and rendered as a "graph_host_node" span in the exported
+        # trace. The graph is captured with torch.cuda.graph (keep_graph so the template stays
+        # live), then a host node is grafted onto it via cudaGraphAddHostNode -- stream capture
+        # never enqueues a host node, so the one node under test needs the runtime primitive --
+        # and the graph is re-instantiated before replay. The node is a libc free(NULL): a safe
+        # no-op on every replay. With enable_graph_dependencies (armed before instantiate, as a
+        # real early-arm would be), the callback's symbol name is recovered from the graph and
+        # the span is named "HostNode: free". Needs a driver new enough to emit the records
+        # (CUDA >= 13.2 / cuda-compat); the CUPTI enable succeeds on older drivers but yields
+        # nothing, so skip rather than falsely fail.
+        import ctypes
+
+        from torch.profiler._cupti._graph_deps import arm_graph_dependency_recording
+
+        try:
+            from cuda.bindings import runtime as cudart
+        except ImportError:
+            self.skipTest("cuda.bindings required")
+        drv = cudart.cudaDriverGetVersion()[1]
+        if drv < 13020:
+            self.skipTest(f"driver {drv} does not emit GRAPH_HOST_NODE (needs >= 13.2)")
+
+        def ck(ret):
+            if int(ret[0]) != int(cudart.cudaError_t.cudaSuccess):
+                raise RuntimeError(f"cuda err {ret[0]}")
+            return ret[1] if len(ret) > 1 else None
+
+        free_addr = ctypes.cast(ctypes.CDLL(None).free, ctypes.c_void_p).value
+        params = cudart.cudaHostNodeParams()
+        try:
+            params.fn = cudart.cudaHostFn_t(init_value=free_addr)
+        except TypeError:
+            params.fn = free_addr
+        params.userData = 0  # free(NULL): safe no-op on every replay
+
+        # Arm before instantiate so the recorder captures the host node's topology + fn name.
+        arm_graph_dependency_recording()
+        x = torch.zeros(8, device="cuda")
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.graph(graph):
+            x.add_(1.0)
+        # raw_cuda_graph() is an int handle; pass it straight to the binding (no typed wrapper).
+        ck(cudart.cudaGraphAddHostNode(graph.raw_cuda_graph(), [], 0, params))
+        graph.instantiate()
+
+        cfg = _ExperimentalConfig(
+            custom_profiler_config='{"backend":"cupti_monitor","enable_graph_dependencies":true}'
+        )
+        with TemporaryFileName(mode="w+") as trace_path:
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                experimental_config=cfg,
+            ) as prof:
+                for _ in range(5):
+                    graph.replay()
+                torch.cuda.synchronize()
+            prof.export_chrome_trace(trace_path)
+            gz = trace_path + ".gz"
+            if os.path.exists(gz):
+                with gzip.open(gz, "rt") as f:
+                    data = json.load(f)
+            else:
+                with open(trace_path) as f:
+                    data = json.load(f)
+
+        host = [e for e in data["traceEvents"] if e.get("cat") == "graph_host_node"]
+        self.assertGreater(len(host), 0)
+        self.assertIn("host thread", host[0]["args"])
+        # The grafted node is libc free; its symbol is recovered and names the span.
+        self.assertEqual(host[0]["name"], "HostNode: free")
+        self.assertEqual(host[0]["args"]["host fn"], "free")
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     @_isolated
