@@ -14,6 +14,7 @@ from typing import Any, TYPE_CHECKING
 from typing_extensions import Self
 from unittest.mock import patch
 
+import torch
 import torch._inductor.config as inductor_config
 from torch._inductor import cache as icache
 from torch._inductor.test_case import run_tests, TestCase
@@ -881,6 +882,144 @@ class ConfigSerializationTest(TestCase):
         with inductor_config.patch(inductor_choices_class=PlainChoices):
             with self.assertRaises(RuntimeError):
                 inductor_config.save_config_portable(ignore_private_configs=False)
+
+
+class AllGatherBucketCacheKeyTest(TestCase):
+    """
+    Regression tests for https://github.com/pytorch/pytorch/issues/188332
+
+    The bucket_all_gathers_fx post-grad pass embeds the distributed rank
+    as a constant in the traced graph (narrow offset into packed buffer).
+    The FX graph cache key must include the rank when bucketing is enabled,
+    otherwise different ranks load each other's compiled code and crash.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        import torch.distributed as dist
+        from torch.testing._internal.distributed.fake_pg import FakeStore
+
+        if not dist.is_initialized():
+            store = FakeStore()
+            dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
+            cls._initialized_pg = True
+        else:
+            cls._initialized_pg = False
+
+    @classmethod
+    def tearDownClass(cls):
+        import torch.distributed as dist
+
+        if cls._initialized_pg:
+            dist.destroy_process_group()
+        super().tearDownClass()
+
+    def test_rank_included_in_cache_key_when_bucketing_enabled(self):
+        """Rank must be part of FxGraphHashDetails when bucket_all_gathers_fx != 'none'."""
+        from torch._inductor.codecache import FxGraphHashDetails
+
+        with inductor_config.patch({"bucket_all_gathers_fx": "all"}):
+            details = FxGraphHashDetails(None, [], {}, [])
+            self.assertTrue(
+                hasattr(details, "distributed_rank"),
+                "FxGraphHashDetails must include distributed_rank when bucketing is enabled",
+            )
+            self.assertEqual(details.distributed_rank, 0)
+
+    def test_rank_excluded_from_cache_key_when_bucketing_disabled(self):
+        """No unnecessary cache fragmentation when bucketing is off."""
+        from torch._inductor.codecache import FxGraphHashDetails
+
+        with inductor_config.patch({"bucket_all_gathers_fx": "none"}):
+            details = FxGraphHashDetails(None, [], {}, [])
+            self.assertFalse(
+                hasattr(details, "distributed_rank"),
+                "distributed_rank must NOT be in cache key when bucketing is disabled",
+            )
+
+    def test_different_ranks_produce_different_cache_keys(self):
+        """Different ranks must produce different cache keys to avoid collision."""
+        from torch._inductor.codecache import FxGraphCachePickler, FxGraphHashDetails
+
+        with inductor_config.patch({"bucket_all_gathers_fx": "all"}):
+            d0 = FxGraphHashDetails(None, [], {}, [])
+            d0.distributed_rank = 0
+            d1 = FxGraphHashDetails(None, [], {}, [])
+            d1.distributed_rank = 1
+
+            gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+            pickler = FxGraphCachePickler(gm)
+            key0 = pickler.get_key(d0)
+            key1 = pickler.get_key(d1)
+
+            self.assertNotEqual(
+                key0,
+                key1,
+                "Cache keys must differ between ranks when all-gather bucketing is enabled",
+            )
+
+    def test_same_rank_produces_deterministic_key(self):
+        """Same rank + config must always yield the same cache key."""
+        from torch._inductor.codecache import FxGraphCachePickler, FxGraphHashDetails
+
+        with inductor_config.patch({"bucket_all_gathers_fx": "all"}):
+            d1 = FxGraphHashDetails(None, [], {}, [])
+            d2 = FxGraphHashDetails(None, [], {}, [])
+
+            gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+            pickler = FxGraphCachePickler(gm)
+            self.assertEqual(pickler.get_key(d1), pickler.get_key(d2))
+
+    def test_only_fsdp_mode_includes_rank(self):
+        """bucket_all_gathers_fx='only_fsdp' also needs rank in the key."""
+        from torch._inductor.codecache import FxGraphHashDetails
+
+        with inductor_config.patch({"bucket_all_gathers_fx": "only_fsdp"}):
+            details = FxGraphHashDetails(None, [], {}, [])
+            self.assertTrue(hasattr(details, "distributed_rank"))
+
+    def test_overlap_scheduling_includes_rank(self):
+        """enable_overlap_scheduling also triggers bucketed all-gather with rank."""
+        from torch._inductor.codecache import FxGraphHashDetails
+
+        with inductor_config.patch(
+            {
+                "bucket_all_gathers_fx": "none",
+                "aten_distributed_optimizations.enable_overlap_scheduling": True,
+            }
+        ):
+            details = FxGraphHashDetails(None, [], {}, [])
+            self.assertTrue(
+                hasattr(details, "distributed_rank"),
+                "Rank must be in cache key when overlap scheduling is enabled",
+            )
+
+    def test_bucketed_allgather_graphs_differ_by_rank(self):
+        """Confirm the underlying bug: traced bucketed graphs embed rank as constant."""
+        from torch._inductor.fx_passes.bucketing import all_gather_merge_fn_to_trace
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        with FakeTensorMode():
+            ins = [torch.randn(128, 256, device="cuda") for _ in range(2)]
+            gm0 = make_fx(all_gather_merge_fn_to_trace)(
+                ins, "0", 2, torch.float32, [torch.float32, torch.float32], 0
+            )
+            gm1 = make_fx(all_gather_merge_fn_to_trace)(
+                ins, "0", 2, torch.float32, [torch.float32, torch.float32], 1
+            )
+
+        graph0 = gm0.print_readable(print_output=False)
+        graph1 = gm1.print_readable(print_output=False)
+        self.assertNotEqual(
+            graph0,
+            graph1,
+            "Traced bucketed all-gather must differ by rank (narrow offset is rank-specific)",
+        )
+        # Verify rank 0 uses offset 0, rank 1 uses offset > 0
+        self.assertIn("slice.Tensor(empty, 0, 0,", graph0)
+        self.assertIn("slice.Tensor(empty, 0, 65536,", graph1)
 
 
 if __name__ == "__main__":

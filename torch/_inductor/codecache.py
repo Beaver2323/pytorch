@@ -1630,6 +1630,23 @@ class FxGraphHashDetails:
                 ):
                     self.cudagraph_annotation = annotation
 
+        # The bucket_all_gathers_fx post-grad pass and the overlap scheduling
+        # pass both embed the distributed rank as a constant in the traced
+        # graph (used for the narrow offset into the packed all-gather buffer).
+        # Since the cache key is computed before post_grad_passes run, we must
+        # include the rank here to prevent one rank's compiled code from being
+        # loaded by another rank.
+        # See https://github.com/pytorch/pytorch/issues/188332
+        if (
+            (
+                config.bucket_all_gathers_fx != "none"
+                or config.aten_distributed_optimizations.enable_overlap_scheduling
+            )
+            and dist.is_available()
+            and dist.is_initialized()
+        ):
+            self.distributed_rank = dist.get_rank()
+
         # Also hash on various system info (including the triton compiler version).
         self.torch_version = torch_key()
         self.system_info = CacheBase.get_system()
