@@ -3186,6 +3186,11 @@ class CppVecKernel(CppKernel):
             )
         return code
 
+    def _use_atomic_add_vec(self, mode):
+        return mode == "atomic_add" and (
+            config.cpp.dynamic_threads or self.num_threads != 1
+        )
+
     def store(self, name, index, value, mode=None):
         if "buf" not in name:
             raise AssertionError('expected "buf" in name')
@@ -3201,7 +3206,7 @@ class CppVecKernel(CppKernel):
             code = self._get_store_line(value, var, index, dtype)
             self.stores.splice(code.map(lambda x: DeferredLine(name, x)))
         elif mode == "atomic_add":
-            if not config.cpp.dynamic_threads and self.num_threads == 1:
+            if not self._use_atomic_add_vec(mode):
                 code = self._get_store_line(
                     f"{value}",
                     var,
@@ -4024,7 +4029,9 @@ class CppTile2DKernel(CppVecKernel):
                 line = f"{value}.store({storebuf});"
             self.stores.writeline(DeferredLine(name, line))
         else:
-            new_index = self.transform_indexing(index)
+            # the vec atomic_add path re-applies transform_indexing via ops.index_expr
+            vec_atomic_add = self._use_atomic_add_vec(mode)
+            new_index = index if vec_atomic_add else self.transform_indexing(index)
             super().store(name, new_index, value, mode)
 
     def codegen_inner_loops(self, code):
