@@ -2165,27 +2165,30 @@ class PythonWrapperCodegen(CodeGen):
         self.writeline(ExitCudaMemPoolContextLine())
 
     def generate_return(self, output_refs: list[str]) -> None:
-        # A repeated bare name in output_refs would return the same tensor
-        # object multiple times, while eager mode returns distinct tensors
-        # that alias the same storage. The difference is observable by user
-        # code running after a graph break: resize_() on one output also
-        # resizes the others and corrupts results (see #191449). Duplicated
-        # expression refs (e.g. reinterpret_tensor(...)) already evaluate to
-        # distinct objects, so only bare names need wrapping.
-        seen_refs: OrderedSet[str] = OrderedSet()
-        deduped_refs: list[str] = []
-        for ref in output_refs:
-            is_repeated_name = (
-                ref in seen_refs
-                and ref.isidentifier()
-                and ref not in ("None", "True", "False")
+        # Distinct FX tensor outputs can collapse to the same bare buffer name.
+        # Return a view for repeated names so that resizing one output does not
+        # resize the others (see #191449). If the same output node is duplicated,
+        # view_as merely introduces a benign identity difference while
+        # preserving aliasing.
+        graph_outputs = self.get_graph_outputs()
+        if len(graph_outputs) == len(output_refs):
+            seen_refs: OrderedSet[str] = OrderedSet()
+            deduped_refs = list(output_refs)
+            tensor_output_types = (
+                ir.StorageBox,
+                ir.BaseView,
+                ir.InputBuffer,
+                ir.TensorBox,
             )
-            if is_repeated_name:
-                deduped_refs.append(f"{ref}.view_as({ref})")
-            else:
+            for i, ref in enumerate(output_refs):
+                if (
+                    ref in seen_refs
+                    and ref.isidentifier()
+                    and isinstance(graph_outputs[i], tensor_output_types)
+                ):
+                    deduped_refs[i] = f"{ref}.view_as({ref})"
                 seen_refs.add(ref)
-                deduped_refs.append(ref)
-        output_refs = deduped_refs
+            output_refs = deduped_refs
         if output_refs:
             if config.nan_asserts:
                 self.wrapper_call.writeline(
