@@ -361,6 +361,27 @@ class TestInductorDynamic(DynamicShapesTestCase):
         )
         self.assertEqual(fn(arg0_test, arg1_test), compiled_fn(arg0_test, arg1_test))
 
+    def test_saved_activation_symbolic_stride_backward(self, device):
+        # The permuted view saved for backward has an outer stride that depends
+        # on a dynamic dim. Inductor's recorded forward output stride must stay
+        # symbolic: collapsing it to the first input's hint freezes a constant
+        # into the backward graph, which is wrong at every other size.
+        def fn(x, w):
+            return (x.permute(0, 2, 1) @ w).sum()
+
+        cfn = self.compile_fn(fn)
+        for n in (8, 12):
+            x = torch.randn(2, n, 4, device=device, requires_grad=True)
+            w = torch.randn(2, n, 3, device=device, requires_grad=True)
+            x_ref = x.detach().clone().requires_grad_()
+            w_ref = w.detach().clone().requires_grad_()
+
+            cfn(x, w).backward()
+            fn(x_ref, w_ref).backward()
+
+            self.assertEqual(x.grad, x_ref.grad)
+            self.assertEqual(w.grad, w_ref.grad)
+
     def test_arange_dynamic(self, device):
         def fn(a):
             batch_size = a.numel()
