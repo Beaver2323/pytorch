@@ -27,7 +27,11 @@ from ...ir import (
     Pointwise,
     Reduction,
 )
-from ...kernel.gemm_epilogue import GemmReductionConfig, GemmReductionPlan
+from ...kernel.gemm_epilogue import (
+    GEMM_ACCUMULATOR_ARG_NAME,
+    GemmReductionConfig,
+    GemmReductionPlan,
+)
 from ...kernel.loop_ir_cutedsl_codegen import LoopIRCuteDSLCodegen
 from ...kernel.loop_ir_epilogue_lowering import (
     centered_mean_consumer_type_unrolled_ir,
@@ -43,7 +47,7 @@ from ...scheduler import (
 )
 from ...virtualized import V
 from ..common import BackendFeature, IndentedBuffer
-from ..cutlass.python_evt import _ACCUMULATOR_ARG_NAME, CutlassEVTCodegen
+from ..cutlass.python_evt import CutlassEVTCodegen
 from .nv_universal_gemm import NVUniversalGemmCaller
 
 
@@ -776,7 +780,7 @@ class NVUniversalGemmScheduling(BaseScheduling):
                     )
                     epilogue_writes = [feed_main.output_name]
                     epilogue_var_renames = {
-                        _ACCUMULATOR_ARG_NAME: original_buffer_name,
+                        GEMM_ACCUMULATOR_ARG_NAME: original_buffer_name,
                         "D": feed_main.output_name,
                     }
                 evt_nodes = [] if feed_main is not None else plan.evt_nodes
