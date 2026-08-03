@@ -1,12 +1,11 @@
 # mypy: allow-untyped-defs
-import functools
 import hashlib
 import logging
-import os
 from collections.abc import Sequence
 from typing import cast
 
 from torch._inductor.utils import Placeholder
+from torch._native.flydsl_utils import _resolve_rocm_arch
 from torch.utils._ordered_set import OrderedSet
 
 from ... import config
@@ -20,22 +19,6 @@ from ..common import BackendFeature, IndentedBuffer
 
 
 log = logging.getLogger(__name__)
-
-
-@functools.lru_cache(None)
-def _get_flydsl_device_arch(device_index: int) -> str | None:
-    """Return the cached ROCm architecture reported for a device."""
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(device_index)
-            arch = getattr(props, "gcnArchName", None)
-            if arch:
-                return str(arch).split(":", 1)[0]
-    except Exception:
-        log.debug("Could not determine FlyDSL GPU arch", exc_info=True)
-    return None
 
 
 class FlyDSLScheduling(BaseScheduling):
@@ -202,19 +185,4 @@ class FlyDSLScheduling(BaseScheduling):
     @staticmethod
     def _build_flydsl_gpu_arch(device_index) -> str | None:
         """Best-effort ROCm arch string for FlyDSL worker precompilation."""
-        arch = os.environ.get("FLYDSL_GPU_ARCH")
-        if arch:
-            return arch.split(":", 1)[0]
-
-        hsa_arch = os.environ.get("HSA_OVERRIDE_GFX_VERSION")
-        if hsa_arch:
-            if hsa_arch.startswith("gfx"):
-                return hsa_arch
-            if hsa_arch.count(".") == 2:
-                major, minor, stepping = hsa_arch.split(".")
-                try:
-                    return f"gfx{major}{minor}{int(stepping):x}"
-                except ValueError:
-                    log.debug("Ignoring invalid HSA_OVERRIDE_GFX_VERSION=%s", hsa_arch)
-
-        return _get_flydsl_device_arch(device_index)
+        return _resolve_rocm_arch(device_index)

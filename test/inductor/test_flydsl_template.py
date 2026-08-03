@@ -6,22 +6,20 @@ from unittest import mock
 import torch
 from torch._inductor.codegen.flydsl import flydsl_utils
 from torch._inductor.codegen.flydsl.flydsl_kernel import FlyDSLTemplateKernel
-from torch._inductor.codegen.flydsl.flydsl_scheduling import (
-    _get_flydsl_device_arch,
-    FlyDSLScheduling,
-)
+from torch._inductor.codegen.flydsl.flydsl_scheduling import FlyDSLScheduling
 from torch._inductor.codegen.flydsl.flydsl_template import (
     _ordered_unique_input_names,
     FlyDSLTemplate,
 )
 from torch._inductor.select_algorithm import PartialRender
 from torch._inductor.test_case import TestCase
+from torch._native.flydsl_utils import _resolve_rocm_arch
 
 
 class TestFlyDSLTemplate(TestCase):
     def setUp(self):
         super().setUp()
-        _get_flydsl_device_arch.cache_clear()
+        _resolve_rocm_arch.cache_clear()
 
     def test_gen_imports(self):
         kernel = FlyDSLTemplateKernel(
@@ -191,6 +189,19 @@ class TestFlyDSLTemplate(TestCase):
             self.assertEqual(
                 FlyDSLScheduling._build_flydsl_gpu_arch(device_index=0),
                 "gfx90a",
+            )
+
+    def test_scheduling_preserves_hsa_override_feature_flags(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FLYDSL_GPU_ARCH": "",
+                "HSA_OVERRIDE_GFX_VERSION": "gfx950:sramecc+",
+            },
+        ):
+            self.assertEqual(
+                FlyDSLScheduling._build_flydsl_gpu_arch(device_index=0),
+                "gfx950:sramecc+",
             )
 
     def test_scheduling_returns_none_without_arch_or_device(self):
