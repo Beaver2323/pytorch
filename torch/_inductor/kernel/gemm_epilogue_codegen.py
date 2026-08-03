@@ -109,30 +109,26 @@ class GemmReductionCompileConfig:
             args.feeds_main,
         )
 
-    def _primary_callbacks(self, *, include_consumer: bool = True) -> tuple[Any, ...]:
+    def _primary_callbacks(self) -> tuple[Any, ...]:
         reduction = self.reduction
-        callbacks = (
+        return (
             reduction.reduce_op,
             reduction.init_val,
             reduction.combine,
             reduction.source,
             reduction.finalize,
-        )
-        return (*callbacks, self.consumer) if include_consumer else callbacks
-
-    def primary_constexprs(self, *, include_consumer: bool = True) -> tuple[Any, ...]:
-        return self._common_constexprs() + self._primary_callbacks(
-            include_consumer=include_consumer
+            self.consumer,
         )
 
-    def constexprs(self, *, include_consumers: bool = True) -> tuple[Any, ...]:
-        constexprs = (
+    def primary_constexprs(self) -> tuple[Any, ...]:
+        return self._common_constexprs() + self._primary_callbacks()
+
+    def constexprs(self) -> tuple[Any, ...]:
+        return (
             *self._common_constexprs(),
             self.args.secondary_feed_type,
-            *self._primary_callbacks(include_consumer=include_consumers),
-        )
-        return (
-            (*constexprs, self.secondary_consumer) if include_consumers else constexprs
+            *self._primary_callbacks(),
+            self.secondary_consumer,
         )
 
 

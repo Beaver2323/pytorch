@@ -13,10 +13,14 @@ programs must fall back without partially claiming their reduction producers.
    `NVGemmEpilogueProgram`. The program owns captured nodes, reduction regions,
    the backend-neutral `GemmReductionPlan`, and tile constraints.
 3. `NVUniversalGemmScheduling` applies fusion ordering, provider capability,
-   and output-liveness policy. Fusion capability checks reuse the program's
-   recognition results.
-4. Pointwise Loop IR becomes direct CuTeDSL source. Reduction callbacks become
-   a `GemmReductionCompileConfig` shared by dense and block-scaled providers.
+   and output-liveness policy. Pointwise lowering produces a
+   `GemmEpiloguePlan` containing source, inputs, outputs, and name bindings.
+4. Supported pointwise Loop IR becomes direct CuTeDSL source; unsupported
+   expressions fall back to EVT through the same plan. Reduction callbacks
+   become a `GemmReductionCompileConfig` shared by dense and block-scaled
+   providers.
+5. Scheduling and both providers validate the same reduction contract through
+   `NVGemmReductionCapabilities` before the kernel claims its nodes.
 
 ## Backend parity
 
