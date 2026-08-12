@@ -15,6 +15,7 @@ The abstraction layer enables device-agnostic code in TorchDynamo while allowing
 specialized implementations for each hardware backend's unique features.
 """
 
+import functools
 import inspect
 import time
 from collections import namedtuple
@@ -43,12 +44,21 @@ class DeviceInterface:
     backends to be integrated with Inductor in a device-agnostic semantic.
     """
 
-    # Device-specific tensor types (e.g. torch.cuda.FloatTensor). Dynamo traces
-    # calls to these as in-graph tensor constructors rather than treating them
-    # as opaque user-defined classes; see
-    # UserDefinedClassVariable._in_graph_classes(). Backends that expose such
-    # types should override this with a frozenset containing them.
+    # Classes that Dynamo must give special treatment to rather than tracing as
+    # opaque user-defined classes. Both default to empty, so declaring them
+    # changes nothing for backends that do not opt in.
+
+    # Device-specific tensor types (e.g. torch.cuda.FloatTensor). Traced as
+    # in-graph tensor constructors; see
+    # UserDefinedClassVariable._in_graph_classes().
     tensor_types: frozenset[type] = frozenset()
+
+    # Device-specific torch.amp.autocast subclasses (e.g. torch.cuda.amp.autocast).
+    # Traced symbolically into _enter_autocast/_exit_autocast graph nodes; see
+    # AutocastModeVariable.create(). The device_type these translate to is taken
+    # from the key this interface is registered under, not declared here, so the
+    # two can never disagree.
+    autocast_classes: frozenset[type] = frozenset()
 
     class device:
         def __new__(cls, device: torch.types.Device) -> Any:
@@ -643,17 +653,39 @@ device_interfaces: dict[str, type[DeviceInterface]] = {}
 _device_initialized = False
 
 
+@functools.cache
+def get_device_autocast_classes() -> dict[type, str]:
+    """Map each registered interface's autocast classes to their device_type.
+
+    The device_type comes from the registry key, so a backend only declares
+    *which* classes are its autocast entry points -- it cannot restate the
+    device string and get it wrong. Keys may carry an index ("npu:0"), which is
+    not part of a device_type, so it is stripped.
+
+    Cached; invalidated by register_interface_for_device().
+    """
+    result: dict[type, str] = {}
+    for device, device_interface in get_registered_device_interfaces():
+        device_type = device.split(":")[0]
+        for cls in device_interface.autocast_classes:
+            # An interface is registered under several keys ("npu", "npu:0",
+            # ...); they normalise to the same device_type, so first wins.
+            result.setdefault(cls, device_type)
+    return result
+
+
 def register_interface_for_device(
     device: str | torch.device, device_interface: type[DeviceInterface]
 ) -> None:
     if isinstance(device, torch.device):
         device = device.type
     device_interfaces[device] = device_interface
-    # _in_graph_classes() snapshots this registry, so a late registration
-    # (the common case for out-of-tree backends) must invalidate it.
+    # Both of these snapshot the registry, so a late registration (the common
+    # case for out-of-tree backends) must invalidate them.
     from .variables.user_defined import UserDefinedClassVariable
 
     UserDefinedClassVariable._in_graph_classes.cache_clear()
+    get_device_autocast_classes.cache_clear()
 
 
 def get_interface_for_device(device: str | torch.device) -> type[DeviceInterface]:

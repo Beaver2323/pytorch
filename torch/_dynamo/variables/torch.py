@@ -197,54 +197,67 @@ supported_ctx_manager_classes = dict.fromkeys(
 )
 
 
-def _get_device_autocast_classes() -> dict[type, str]:
-    """Autocast classes registered by out-of-tree DeviceInterfaces.
-
-    Not cached: device interfaces may be registered lazily, so we
-    query each time.
-    """
-    from ..device_interface import get_registered_device_interfaces
-
-    result: dict[type, str] = {}
-    for _, iface in get_registered_device_interfaces():
-        ac = getattr(iface, "autocast_classes", None)
-        if ac:
-            result.update(ac)
-    return result
-
-
 def _matches_device_autocast_class(value) -> bool:
-    """Check if `value` is an autocast class belonging to a registered device.
+    """Whether `value` is an autocast class declared by a registered device.
 
-    Handles the multi-path import identity mismatch where the same class
-    loaded via ``torch.npu.amp`` and ``torch_npu.npu.amp`` has different
-    Python identities.  Falls back to comparing source files when the
-    exact object reference does not match.
+    Also matches a class that is the same source definition reached by a
+    different import path -- e.g. ``torch.npu.amp.autocast`` and
+    ``torch_npu.npu.amp.autocast`` are two Python objects for one class, so an
+    identity check alone would miss whichever one the backend did not register.
     """
+    from ..device_interface import get_device_autocast_classes
+
     if not isinstance(value, type):
         return False
     if not issubclass(value, torch.amp.autocast_mode.autocast):
         return False
+    # The generic base takes device_type as an argument, so it is never a
+    # device's autocast class. Stated explicitly because the same-file fallback
+    # below would otherwise let it match itself if a backend declared it.
     if value is torch.amp.autocast_mode.autocast:
         return False
 
-    registered = _get_device_autocast_classes()
+    registered = get_device_autocast_classes()
     if value in registered:
         return True
-
     if not registered:
         return False
 
-    import inspect
+    return _autocast_class_by_file(value) is not None
 
-    for ac_cls in registered:
+
+def _autocast_class_by_file(value: type) -> type | None:
+    """Registered autocast class defined in the same file as `value`, if any."""
+    from ..device_interface import get_device_autocast_classes
+
+    try:
+        value_file = inspect.getfile(value)
+    except (TypeError, OSError):
+        return None
+    for ac_cls in get_device_autocast_classes():
         try:
-            if inspect.getfile(value) == inspect.getfile(ac_cls):
-                return True
+            if inspect.getfile(ac_cls) == value_file:
+                return ac_cls
         except (TypeError, OSError):
             pass
+    return None
 
-    return False
+
+def device_type_for_autocast_class(value: type) -> str | None:
+    """The device_type a registered autocast class translates to.
+
+    Returns None if `value` is not one -- callers decide whether that is an
+    error. Used by AutocastModeVariable.create(), where the device_type is not
+    an argument because the subclass constructor supplies it implicitly.
+    """
+    from ..device_interface import get_device_autocast_classes
+
+    registered = get_device_autocast_classes()
+    device_type = registered.get(value)
+    if device_type is not None:
+        return device_type
+    ac_cls = _autocast_class_by_file(value)
+    return None if ac_cls is None else registered[ac_cls]
 
 
 REWRITE_OPS_TO_TENSOR_SIZE_METHOD = dict.fromkeys(
