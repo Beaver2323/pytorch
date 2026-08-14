@@ -652,29 +652,6 @@ def _iter_registered_autocast_classes() -> Iterator[tuple[type, str]]:
             yield autocast_class, device_type
 
 
-def _autocast_class_location(autocast_class: type) -> tuple[str, str] | None:
-    """A class identity that survives the class being imported twice.
-
-    An out-of-tree backend usually installs itself as a ``torch`` submodule, so
-    the same file is reachable under two dotted names, e.g.
-    ``torch_npu.npu.amp.autocast_mode`` and ``torch.npu.amp.autocast_mode``.
-    Importing both names loads two module objects, runs the class body twice and
-    yields two class objects; which one traced code reaches depends on import
-    order, so ``is`` against the registered one is not reliable.  The defining
-    file plus the qualified name is the same for both.
-
-    This is deliberately narrower than matching on the file alone: a *different*
-    class defined in that same file has a different ``__qualname__`` and so
-    still does not match.
-
-    ``None`` means the class has no source file to key on (C extension, exec'd
-    code), in which case only identity matching applies to it.
-    """
-    try:
-        file = inspect.getfile(autocast_class)
-    except (TypeError, OSError):
-        return None
-    return file, autocast_class.__qualname__
 
 
 def _conflict(key: object, previous: str, device_type: str) -> RuntimeError:
@@ -689,7 +666,12 @@ def _conflict(key: object, previous: str, device_type: str) -> RuntimeError:
 
 @functools.cache
 def get_device_autocast_classes() -> dict[type, str]:
-    """Map every registered autocast class to the device_type providing it."""
+    """Map every registered autocast class to the device_type providing it.
+
+    Attempts to register privateuse1 backend lazily on first call, to handle
+    cases where torch.compile() is called before the backend module is imported.
+    """
+    _try_register_privateuse1()
     result: dict[type, str] = {}
     for autocast_class, device_type in _iter_registered_autocast_classes():
         previous = result.setdefault(autocast_class, device_type)
@@ -698,18 +680,45 @@ def get_device_autocast_classes() -> dict[type, str]:
     return result
 
 
-@functools.cache
-def get_device_autocast_class_locations() -> dict[tuple[str, str], str]:
-    """``get_device_autocast_classes`` keyed by ``_autocast_class_location``."""
-    result: dict[tuple[str, str], str] = {}
-    for autocast_class, device_type in _iter_registered_autocast_classes():
-        location = _autocast_class_location(autocast_class)
-        if location is None:
-            continue
-        previous = result.setdefault(location, device_type)
-        if previous != device_type:
-            raise _conflict(location, previous, device_type)
-    return result
+_privateuse1_registration_attempted = False
+
+
+def _try_register_privateuse1() -> None:
+    """Attempt to register the privateuse1 backend's DeviceInterface if available.
+
+    This is called lazily from get_device_autocast_classes to handle the case where
+    torch.compile() is invoked before the backend module (e.g., torch_npu) is imported.
+    Once attempted, this is a no-op on subsequent calls.
+    """
+    global _privateuse1_registration_attempted
+    if _privateuse1_registration_attempted:
+        return
+    _privateuse1_registration_attempted = True
+
+    try:
+        backend_name = torch._C._get_privateuse1_backend_name()
+    except Exception:
+        return
+
+    if not backend_name or backend_name in device_interfaces:
+        return
+
+    backend_module = getattr(torch, backend_name, None)
+    if backend_module is None:
+        return
+
+    # Check if backend provides a DeviceInterface via attribute or callable
+    interface = None
+    if hasattr(backend_module, '_dynamo_device_interface'):
+        attr = getattr(backend_module, '_dynamo_device_interface')
+        interface = attr() if callable(attr) else attr
+    elif hasattr(backend_module, 'get_dynamo_interface'):
+        interface = backend_module.get_dynamo_interface()
+
+    if interface is not None:
+        register_interface_for_device(backend_name, interface)
+
+
 
 
 def device_type_for_autocast_class(autocast_class: Any) -> str | None:
@@ -717,24 +726,22 @@ def device_type_for_autocast_class(autocast_class: Any) -> str | None:
 
     A device opts in by listing the class in ``DeviceInterface.autocast_classes``;
     nothing it did not list can match.  Registered classes are recognised by
-    identity, or failing that by ``_autocast_class_location`` so that a second
-    import of the defining module still resolves.
+    identity only.  If a backend truly needs to register the same class under
+    two import paths, it should explicitly list both class objects.
     """
     if not isinstance(autocast_class, type):
         return None
-    device_type = get_device_autocast_classes().get(autocast_class)
-    if device_type is not None:
-        return device_type
-    location = _autocast_class_location(autocast_class)
-    if location is None:
-        return None
-    return get_device_autocast_class_locations().get(location)
+    return get_device_autocast_classes().get(autocast_class)
 
 
 def _validate_autocast_classes(
     device: str, device_interface: type[DeviceInterface]
 ) -> None:
+    import warnings
+
     base = torch.amp.autocast_mode.autocast
+    base_params = set(inspect.signature(base.__init__).parameters.keys()) - {'self'}
+
     for autocast_class in device_interface.autocast_classes:
         if not (isinstance(autocast_class, type) and issubclass(autocast_class, base)):
             raise TypeError(
@@ -750,6 +757,19 @@ def _validate_autocast_classes(
                 f"device-specific subclass instead."
             )
 
+        # Check if subclass __init__ exposes all base parameters
+        subclass_params = set(inspect.signature(autocast_class.__init__).parameters.keys()) - {'self'}
+        missing = base_params - subclass_params
+        if missing:
+            warnings.warn(
+                f"{autocast_class.__qualname__}.__init__ registered for device "
+                f"{device!r} does not expose parameters {missing} from the base "
+                f"torch.amp.autocast_mode.autocast.__init__. Traced code will use "
+                f"base defaults for these parameters, which may differ from the "
+                f"values the subclass passes to super().__init__ when called eagerly.",
+                stacklevel=3
+            )
+
 
 def register_interface_for_device(
     device: str | torch.device, device_interface: type[DeviceInterface]
@@ -759,7 +779,6 @@ def register_interface_for_device(
     _validate_autocast_classes(device, device_interface)
     device_interfaces[device] = device_interface
     get_device_autocast_classes.cache_clear()
-    get_device_autocast_class_locations.cache_clear()
 
 
 def get_interface_for_device(device: str | torch.device) -> type[DeviceInterface]:

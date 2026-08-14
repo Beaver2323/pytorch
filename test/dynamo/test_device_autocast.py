@@ -10,9 +10,7 @@ import torch._dynamo.test_case
 import torch._dynamo.testing
 from torch._dynamo import device_interface
 from torch._dynamo.device_interface import (
-    _autocast_class_location,
     DeviceInterface,
-    get_device_autocast_class_locations,
     get_device_autocast_classes,
     register_interface_for_device,
 )
@@ -85,12 +83,10 @@ class DeviceAutocastTests(torch._dynamo.test_case.TestCase):
         # Cleanups run LIFO, so clearing the cache is registered first in order
         # to run after the snapshot is restored.
         self.addCleanup(get_device_autocast_classes.cache_clear)
-        self.addCleanup(get_device_autocast_class_locations.cache_clear)
         patcher = mock.patch.dict(device_interface.device_interfaces)
         patcher.start()
         self.addCleanup(patcher.stop)
         get_device_autocast_classes.cache_clear()
-        get_device_autocast_class_locations.cache_clear()
         self._register_stub_device_module()
 
     def _register_stub_device_module(self):
@@ -209,30 +205,27 @@ class DeviceAutocastTests(torch._dynamo.test_case.TestCase):
     def test_same_file_unregistered_class_not_matched(self):
         """A class sharing the defining file with a registered one must not match.
 
-        This is what keying on (file, qualname) buys over keying on the file.
+        With identity-only matching, only explicitly registered classes match.
         """
         register_interface_for_device(STUB_DEVICE, AutocastInterface)
 
-        self.assertEqual(
-            _autocast_class_location(_UnregisteredSiblingAutocast)[0],
-            _autocast_class_location(_StubAutocast)[0],
-        )
         self.assertIsNone(device_type_for_autocast_class(_UnregisteredSiblingAutocast))
 
-    def test_class_reimported_under_another_name_matches(self):
-        """The registered class, reached through a second import of its file.
+    def test_reimported_class_not_matched_without_explicit_registration(self):
+        """Identity-only matching: reimported class must be explicitly registered.
 
-        Real out-of-tree backends hit this: the interface captures the class from
-        one module object while traced code reaches the copy created by a second
-        import, so identity alone silently stops matching.
+        After removing the (file, qualname) fallback, a class imported twice
+        yields two distinct class objects that do not match each other unless
+        both are explicitly registered.  Backends that need both import paths
+        to work must register both class objects.
         """
         register_interface_for_device(STUB_DEVICE, AutocastInterface)
         duplicate = self._reimport_this_file()._StubAutocast
 
         self.assertIsNot(duplicate, _StubAutocast)
         self.assertNotIn(duplicate, get_device_autocast_classes())
-        self.assertTrue(_matches_device_autocast_class(duplicate))
-        self.assertEqual(device_type_for_autocast_class(duplicate), STUB_DEVICE)
+        self.assertFalse(_matches_device_autocast_class(duplicate))
+        self.assertIsNone(device_type_for_autocast_class(duplicate))
 
     def test_reimported_unregistered_class_not_matched(self):
         """The second import must not widen what matches."""
@@ -253,20 +246,24 @@ class DeviceAutocastTests(torch._dynamo.test_case.TestCase):
         class FilelessInterface(DeviceInterface):
             autocast_classes = frozenset({fileless})
 
-        self.assertIsNone(_autocast_class_location(fileless))
         register_interface_for_device(STUB_DEVICE, FilelessInterface)
 
         self.assertEqual(device_type_for_autocast_class(fileless), STUB_DEVICE)
 
     def test_reimported_class_traced(self):
-        """End to end: the duplicate class still produces an autocast node."""
+        """End to end: a reimported duplicate must be explicitly registered to trace.
+
+        With identity-only matching, the duplicate class object does not match
+        unless explicitly registered.  This test verifies that tracing falls back
+        to inlining rather than producing an autocast node.
+        """
         register_interface_for_device(STUB_DEVICE, AutocastInterface)
         duplicate = self._reimport_this_file()._StubAutocast
 
+        # Should inline instead of producing an autocast node
         nodes = self._compile_autocast_region(duplicate)
 
-        self.assertEqual(len(nodes), 1)
-        self.assertEqual(nodes[0].args[0], STUB_DEVICE)
+        self.assertEqual(len(nodes), 0)
 
     def test_registered_autocast_class_traced(self):
         register_interface_for_device(STUB_DEVICE, AutocastInterface)
